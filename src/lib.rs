@@ -10,16 +10,22 @@
 //! - [`faults`] — the unreliable-wire spec and its transforms
 //! - [`frame`] — the frame tap the inspector reads
 //! - [`format`] — the JSON [`WireFormat`](comline_runtime::contract::WireFormat)
+//! - [`shape`] — the compiled-project projection the playground's `describe_project` emits
 //! - [`clock`] — the virtual clock and its event queue
 //! - [`wire`] — one connection's tapped, fault-injecting channel
+//! - [`behavior`] — what a server instance does for one function
+//! - [`generic`] — a dispatcher driven by a [`shape::ProtocolShape`], no codegen
 //! - [`pump`] — the discrete-event pump that ties a call to its reply
 
+pub mod behavior;
 pub mod clock;
 pub mod faults;
 pub mod format;
 pub mod frame;
+pub mod generic;
 pub mod pump;
 pub mod rng;
+pub mod shape;
 pub mod wire;
 
 use wasm_bindgen::prelude::*;
@@ -32,7 +38,7 @@ use pump::Pump;
 #[wasm_bindgen]
 pub fn smoke() -> String {
     let mut pump = Pump::new();
-    if let Err(e) = pump.call(0, &serde_json::json!(["hi"])) {
+    if let Err(e) = pump.call("send", &serde_json::json!(["hi"])) {
         return format!("error: {e:?}");
     }
     pump.run();
