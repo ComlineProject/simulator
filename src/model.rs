@@ -503,68 +503,9 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shape::{ArgShape, FnShape, Framing, ProtocolShape, SchemaShape, TypeDef, TypeRef};
+    use crate::fixtures::{fn_shape as chat_fn, shape_with as chat_shape};
+    use crate::shape::FnShape;
     use serde_json::json;
-
-    fn string_ty() -> TypeRef {
-        TypeRef::Prim {
-            name: "string".into(),
-        }
-    }
-
-    fn chat_fn(name: &str, index: u32, oneway: bool) -> FnShape {
-        FnShape {
-            name: name.into(),
-            index,
-            oneway,
-            args: vec![ArgShape {
-                name: "text".into(),
-                ty: string_ty(),
-            }],
-            returns: if oneway {
-                None
-            } else {
-                Some(TypeRef::Ref {
-                    name: "Message".into(),
-                })
-            },
-            throws: vec![],
-        }
-    }
-
-    fn message_type() -> TypeDef {
-        TypeDef::Struct {
-            name: "Message".into(),
-            fields: vec![
-                crate::shape::FieldShape {
-                    name: "body".into(),
-                    ty: string_ty(),
-                    optional: false,
-                },
-                crate::shape::FieldShape {
-                    name: "seq".into(),
-                    ty: TypeRef::Prim { name: "u64".into() },
-                    optional: false,
-                },
-            ],
-        }
-    }
-
-    fn chat_shape(functions: Vec<FnShape>, ir_hash: &str) -> ProjectShape {
-        ProjectShape {
-            schemas: vec![SchemaShape {
-                namespace: "chat".into(),
-                ir_hash: ir_hash.into(),
-                protocols: vec![ProtocolShape {
-                    name: "Chat".into(),
-                    framing: Framing::Datagram,
-                    functions,
-                }],
-                errors: vec![],
-                types: vec![message_type()],
-            }],
-        }
-    }
 
     fn spec(role: Role) -> InstanceSpec {
         InstanceSpec {

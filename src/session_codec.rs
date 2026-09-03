@@ -100,47 +100,8 @@ fn percent_decode(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::behavior::BehaviorKind;
+    use crate::fixtures::shape as chat_shape;
     use crate::model::{InstanceSpec, Placement, Role};
-    use crate::shape::{
-        ArgShape, FieldShape, FnShape, Framing, ProtocolShape, SchemaShape, TypeDef, TypeRef,
-    };
-
-    fn chat_shape() -> ProjectShape {
-        ProjectShape {
-            schemas: vec![SchemaShape {
-                namespace: "chat".into(),
-                ir_hash: "0xabcd".into(),
-                protocols: vec![ProtocolShape {
-                    name: "Chat".into(),
-                    framing: Framing::Datagram,
-                    functions: vec![FnShape {
-                        name: "send".into(),
-                        index: 0,
-                        oneway: false,
-                        args: vec![ArgShape {
-                            name: "text".into(),
-                            ty: TypeRef::Prim {
-                                name: "string".into(),
-                            },
-                        }],
-                        returns: Some(TypeRef::Ref {
-                            name: "Message".into(),
-                        }),
-                        throws: vec![],
-                    }],
-                }],
-                errors: vec![],
-                types: vec![TypeDef::Struct {
-                    name: "Message".into(),
-                    fields: vec![FieldShape {
-                        name: "seq".into(),
-                        ty: TypeRef::Prim { name: "u64".into() },
-                        optional: false,
-                    }],
-                }],
-            }],
-        }
-    }
 
     fn peopled_session() -> Session {
         let mut s = Session::empty(chat_shape());

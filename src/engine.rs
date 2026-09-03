@@ -767,110 +767,11 @@ fn handshake_frame(ir_hash: &str, wire_format: &str, framing: &str) -> Vec<u8> {
     buf
 }
 
-/// A one-connection chat engine, shared by `smoke()` and the tests.
-pub(crate) mod chat {
-    use super::*;
-    use crate::model::{InstanceSpec, Placement, Role};
-    use crate::shape::{
-        ArgShape, FieldShape, FnShape, Framing, ProjectShape, SchemaShape, TypeDef, TypeRef,
-    };
-
-    /// The connection id `add_connection` assigns the single wire.
-    pub const CONN: &str = "c1";
-
-    pub fn shape() -> ProjectShape {
-        let string = || TypeRef::Prim {
-            name: "string".into(),
-        };
-        ProjectShape {
-            schemas: vec![SchemaShape {
-                namespace: "chat".into(),
-                ir_hash: "0x9f2b1c7d4e6a8035".into(),
-                protocols: vec![ProtocolShape {
-                    name: "Chat".into(),
-                    framing: Framing::Datagram,
-                    functions: vec![FnShape {
-                        name: "send".into(),
-                        index: 0,
-                        oneway: false,
-                        args: vec![ArgShape {
-                            name: "text".into(),
-                            ty: string(),
-                        }],
-                        returns: Some(TypeRef::Ref {
-                            name: "Message".into(),
-                        }),
-                        throws: vec![],
-                    }],
-                }],
-                errors: vec![],
-                types: vec![TypeDef::Struct {
-                    name: "Message".into(),
-                    fields: vec![
-                        FieldShape {
-                            name: "body".into(),
-                            ty: string(),
-                            optional: false,
-                        },
-                        FieldShape {
-                            name: "seq".into(),
-                            ty: TypeRef::Prim { name: "u64".into() },
-                            optional: false,
-                        },
-                    ],
-                }],
-            }],
-        }
-    }
-
-    /// `chat-1` (server, `send` → reply `{body:"HELLO",seq:1}`) with `chat-2`
-    /// (client) connected as `c1`.
-    pub fn session() -> Session {
-        let mut s = Session::empty(shape());
-        let srv = s.add_instance(
-            InstanceSpec {
-                schema_ns: "chat".into(),
-                protocol: "Chat".into(),
-                role: Role::Server,
-            },
-            Placement::default(),
-        );
-        let cli = s.add_instance(
-            InstanceSpec {
-                schema_ns: "chat".into(),
-                protocol: "Chat".into(),
-                role: Role::Client,
-            },
-            Placement::default(),
-        );
-        s.set_behavior(
-            &srv,
-            "send",
-            BehaviorKind::Reply,
-            Some(json!({ "value": { "body": "HELLO", "seq": 1 } })),
-        )
-        .unwrap();
-        s.add_connection(&cli, &srv).unwrap();
-        s
-    }
-
-    pub fn engine() -> Engine {
-        let mut e = Engine::new();
-        e.sync(&session());
-        e
-    }
-
-    #[allow(dead_code)]
-    pub fn schema() -> SchemaShape {
-        shape().schemas.into_iter().next().unwrap()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::chat::{self, CONN};
     use super::*;
     use crate::faults::FaultDir;
+    use crate::fixtures::{self as chat, CONN};
     use crate::frame::FrameKind;
     use crate::model::{InstanceSpec, Placement, Role};
     use serde_json::json;

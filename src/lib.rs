@@ -3,8 +3,7 @@
 //! contract (framing / envelope / handshake / dispatch), in-memory, driven as a
 //! discrete-event simulation on a single thread so a virtual clock can pause it.
 //!
-//! The engine is being ported from the playground's TypeScript (`app/src/sim/`)
-//! module by module:
+//! Modules:
 //!
 //! - [`rng`] — seeded PRNG, bit-for-bit with the JS reference
 //! - [`faults`] — the unreliable-wire spec and its transforms
@@ -41,37 +40,5 @@ pub mod wire;
 
 pub use facade::Sim;
 
-use wasm_bindgen::prelude::*;
-
-/// WASM smoke test: run one `send` call through the engine and return the frame
-/// log as a JSON string (or `"error: …"`). The playground's real surface lands
-/// here as the port progresses.
-#[wasm_bindgen]
-pub fn smoke() -> String {
-    let mut sim = engine::chat::engine();
-    if let Err(e) = sim.call(engine::chat::CONN, "send", &serde_json::json!(["hi"])) {
-        return format!("error: {e:?}");
-    }
-    sim.run();
-    match sim.tap(engine::chat::CONN) {
-        Some(tap) => serde_json::to_string(&tap.frames).unwrap_or_else(|_| "[]".into()),
-        None => "[]".into(),
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn smoke_logs_a_handshake_a_request_and_a_response() {
-        let log = smoke();
-        let frames: Vec<serde_json::Value> = serde_json::from_str(&log).unwrap();
-        // two handshake frames, then the request and the response
-        assert_eq!(frames.len(), 4);
-        assert_eq!(frames[0]["kind"], "handshake");
-        assert_eq!(frames[2]["kind"], "request");
-        assert_eq!(frames[2]["from"], "chat-2");
-        assert_eq!(frames[3]["from"], "chat-1");
-    }
-}
+mod fixtures;

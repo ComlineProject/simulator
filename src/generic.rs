@@ -80,38 +80,8 @@ mod tests {
     use super::*;
 
     use crate::behavior::{BehaviorKind, Echo, SimOutcome};
+    use crate::fixtures::{proto as chat_proto, schema as chat_schema};
     use crate::format::Json;
-    use crate::shape::{FnShape, Framing, SchemaShape, TypeDef, TypeRef};
-
-    fn chat_proto() -> ProtocolShape {
-        ProtocolShape {
-            name: "Chat".into(),
-            framing: Framing::Datagram,
-            functions: vec![FnShape {
-                name: "send".into(),
-                index: 0,
-                oneway: false,
-                args: vec![],
-                returns: Some(TypeRef::Ref {
-                    name: "Message".into(),
-                }),
-                throws: vec![],
-            }],
-        }
-    }
-
-    fn chat_schema() -> SchemaShape {
-        SchemaShape {
-            namespace: "chat".into(),
-            ir_hash: "0x0".into(),
-            protocols: vec![chat_proto()],
-            errors: vec![],
-            types: vec![TypeDef::Struct {
-                name: "Message".into(),
-                fields: vec![],
-            }],
-        }
-    }
 
     fn step(
         d: &GenericDispatch,

@@ -363,7 +363,7 @@ mod tests {
 
     // ── replay ──────────────────────────────────────────────────────────
 
-    use crate::engine::chat;
+    use crate::fixtures as chat;
 
     fn call_at(at: f64, params: Value) -> InputEvent {
         InputEvent {

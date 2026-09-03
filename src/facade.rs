@@ -496,7 +496,7 @@ impl Sim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::chat;
+    use crate::fixtures as chat;
     use serde_json::json;
 
     fn sim() -> Sim {
