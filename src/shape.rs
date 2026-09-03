@@ -179,10 +179,29 @@ fn zero_prim(name: &str) -> Value {
     match name {
         "bool" => Value::Bool(false),
         "string" | "str" => Value::String(String::new()),
-        "u8" | "u16" | "u32" | "u64" | "u128" | "s8" | "s16" | "s32" | "s64" | "s128" | "f32"
-        | "f64" | "float" => Value::from(0),
+        n if is_numeric_prim(n) => Value::from(0),
         _ => Value::Null,
     }
+}
+
+/// A Comline integer / float primitive — `u8`..`u128`, `s8`..`s128`, `f32` /
+/// `f64` / `float`. Mirrors the regexes in `shape.ts` / `behavior.ts`.
+pub fn is_numeric_prim(name: &str) -> bool {
+    matches!(
+        name,
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "s8"
+            | "s16"
+            | "s32"
+            | "s64"
+            | "s128"
+            | "f32"
+            | "f64"
+            | "float"
+    )
 }
 
 #[cfg(test)]

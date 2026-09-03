@@ -1,20 +1,20 @@
 //! Route B: one dispatcher that reads a [`ProtocolShape`] and does what a
-//! generated `<Proto>Dispatcher` does — resolve the call, decode the params, run
-//! the instance's [`Behavior`] for that function, and write the outcome to the
-//! [`Reply`] in the three shapes a generated dispatcher writes. So any compiled
-//! schema is driven without code generation.
+//! generated `<Proto>Dispatcher` does — resolve the call, decode the params, and
+//! run the instance's [`Behavior`] for that function. So any compiled schema is
+//! driven without code generation.
 //!
 //! Ported from `GenericDispatch` in the playground's `generic.ts`. The consumer
 //! side (`GenericClient`) has no analogue here — the [`Pump`](crate::pump::Pump)
 //! owns the client half of a call directly, since there is no blocking
-//! `Client::call` to wrap.
+//! `Client::call` to wrap. Framing the outcome into a response is the pump's job
+//! too; this type stops at the [`BehaviorStep`].
 
 use std::collections::HashMap;
 
-use comline_runtime::contract::{Reply, RequestCall, RuntimeError, WireFormat};
+use comline_runtime::contract::{RequestCall, RuntimeError, WireFormat};
 use serde_json::Value;
 
-use crate::behavior::{Behavior, BehaviorCtx, SimOutcome};
+use crate::behavior::{Behavior, BehaviorCtx, BehaviorStep};
 use crate::shape::ProtocolShape;
 
 /// One behaviour per function name. The engine swaps entries live so a
@@ -35,25 +35,15 @@ impl GenericDispatch {
         &self.proto
     }
 
-    /// The protocol's function names, in declaration order.
-    pub fn call_names(&self) -> Vec<&str> {
-        self.proto
-            .functions
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect()
-    }
-
-    /// Resolve, decode, run, encode. `behaviors` is passed in (not held) so the
-    /// pump keeps ownership of the live, swappable map.
+    /// Resolve the call and run its behaviour. `behaviors` is passed in (not
+    /// held) so the pump keeps ownership of the live, swappable map.
     pub fn dispatch<W: WireFormat>(
         &self,
         call: RequestCall<'_>,
         params: &[u8],
         fmt: &W,
         behaviors: &mut BehaviorMap,
-        reply: &mut Reply<'_>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<BehaviorStep, RuntimeError> {
         let idx = self.resolve(call).ok_or(RuntimeError::UnknownCall)?;
         let function = &self.proto.functions[idx];
 
@@ -67,26 +57,11 @@ impl GenericDispatch {
             fmt.decode::<Value>(params)?
         };
 
-        let outcome = behavior.run(BehaviorCtx {
+        Ok(behavior.run(BehaviorCtx {
             params: decoded,
             function,
             protocol: &self.proto,
-        });
-
-        match outcome {
-            SimOutcome::Ok(value) => {
-                let mut body = Vec::new();
-                fmt.encode(&value, &mut body)?;
-                reply.ok(&body);
-            }
-            SimOutcome::Err { ordinal, data } => {
-                let mut body = Vec::new();
-                fmt.encode(&data, &mut body)?;
-                reply.err(ordinal, &body);
-            }
-            SimOutcome::None => {} // one-way — nothing to send
-        }
-        Ok(())
+        }))
     }
 
     fn resolve(&self, call: RequestCall<'_>) -> Option<usize> {
@@ -103,11 +78,10 @@ impl GenericDispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use comline_runtime::contract::Outcome;
 
-    use crate::behavior::{Echo, ReplyWith};
+    use crate::behavior::{BehaviorKind, Echo, SimOutcome};
     use crate::format::Json;
-    use crate::shape::{FnShape, Framing};
+    use crate::shape::{FnShape, Framing, SchemaShape, TypeDef, TypeRef};
 
     fn chat_proto() -> ProtocolShape {
         ProtocolShape {
@@ -118,106 +92,108 @@ mod tests {
                 index: 0,
                 oneway: false,
                 args: vec![],
-                returns: None,
+                returns: Some(TypeRef::Ref {
+                    name: "Message".into(),
+                }),
                 throws: vec![],
             }],
         }
     }
 
-    fn run(
+    fn chat_schema() -> SchemaShape {
+        SchemaShape {
+            namespace: "chat".into(),
+            ir_hash: "0x0".into(),
+            protocols: vec![chat_proto()],
+            errors: vec![],
+            types: vec![TypeDef::Struct {
+                name: "Message".into(),
+                fields: vec![],
+            }],
+        }
+    }
+
+    fn step(
         d: &GenericDispatch,
         call: RequestCall<'_>,
         params: &Value,
         behaviors: &mut BehaviorMap,
-    ) -> Result<(Outcome, Value), RuntimeError> {
-        let mut param_bytes = Vec::new();
-        Json.encode(params, &mut param_bytes).unwrap();
-        let mut body = Vec::new();
-        let outcome = {
-            let mut reply = Reply::new(&mut body);
-            d.dispatch(call, &param_bytes, &Json, behaviors, &mut reply)?;
-            reply.outcome()
-        };
-        let decoded = if body.is_empty() {
-            Value::Null
-        } else {
-            Json.decode::<Value>(&body).unwrap()
-        };
-        Ok((outcome, decoded))
+    ) -> Result<BehaviorStep, RuntimeError> {
+        let mut bytes = Vec::new();
+        Json.encode(params, &mut bytes).unwrap();
+        d.dispatch(call, &bytes, &Json, behaviors)
     }
 
     #[test]
     fn resolves_by_id_and_by_name() {
         let d = GenericDispatch::new(chat_proto());
         let mut behaviors: BehaviorMap = HashMap::new();
-        behaviors.insert(
-            "send".into(),
-            Box::new(ReplyWith {
-                value: Value::from(1),
-            }),
-        );
-
-        let (o1, _) = run(&d, RequestCall::Id(0), &Value::Null, &mut behaviors).unwrap();
-        let (o2, _) = run(&d, RequestCall::Name("send"), &Value::Null, &mut behaviors).unwrap();
-        assert_eq!(o1, Outcome::Ok);
-        assert_eq!(o2, Outcome::Ok);
-    }
-
-    #[test]
-    fn an_unknown_call_is_rejected() {
-        let d = GenericDispatch::new(chat_proto());
-        let mut behaviors: BehaviorMap = HashMap::new();
         behaviors.insert("send".into(), Box::new(Echo));
 
-        assert_eq!(
-            run(&d, RequestCall::Id(9), &Value::Null, &mut behaviors).unwrap_err(),
-            RuntimeError::UnknownCall
-        );
-        assert_eq!(
-            run(&d, RequestCall::Name("nope"), &Value::Null, &mut behaviors).unwrap_err(),
-            RuntimeError::UnknownCall
-        );
+        assert!(matches!(
+            step(&d, RequestCall::Id(0), &Value::Null, &mut behaviors).unwrap(),
+            BehaviorStep::Now(_)
+        ));
+        assert!(matches!(
+            step(&d, RequestCall::Name("send"), &Value::Null, &mut behaviors).unwrap(),
+            BehaviorStep::Now(_)
+        ));
     }
 
     #[test]
-    fn a_function_with_no_behaviour_set_is_rejected() {
+    fn an_unknown_call_or_unbound_function_is_rejected() {
         let d = GenericDispatch::new(chat_proto());
         let mut behaviors: BehaviorMap = HashMap::new();
+
         assert_eq!(
-            run(&d, RequestCall::Id(0), &Value::Null, &mut behaviors).unwrap_err(),
+            step(&d, RequestCall::Id(0), &Value::Null, &mut behaviors).unwrap_err(),
+            RuntimeError::UnknownCall,
+            "no behaviour bound"
+        );
+        behaviors.insert("send".into(), Box::new(Echo));
+        assert_eq!(
+            step(&d, RequestCall::Id(9), &Value::Null, &mut behaviors).unwrap_err(),
+            RuntimeError::UnknownCall
+        );
+        assert_eq!(
+            step(&d, RequestCall::Name("nope"), &Value::Null, &mut behaviors).unwrap_err(),
             RuntimeError::UnknownCall
         );
     }
 
     #[test]
-    fn echo_round_trips_the_params_through_the_wire_format() {
+    fn params_reach_the_behaviour_decoded() {
         let d = GenericDispatch::new(chat_proto());
         let mut behaviors: BehaviorMap = HashMap::new();
         behaviors.insert("send".into(), Box::new(Echo));
 
         let params = serde_json::json!(["hello"]);
-        let (outcome, body) = run(&d, RequestCall::Id(0), &params, &mut behaviors).unwrap();
-        assert_eq!(outcome, Outcome::Ok);
-        assert_eq!(body, params);
+        assert_eq!(
+            step(&d, RequestCall::Id(0), &params, &mut behaviors).unwrap(),
+            BehaviorStep::Now(SimOutcome::Ok(params))
+        );
     }
 
     #[test]
-    fn a_raised_error_becomes_an_err_outcome() {
-        struct Raise;
-        impl Behavior for Raise {
-            fn run(&mut self, _ctx: BehaviorCtx<'_>) -> SimOutcome {
-                SimOutcome::Err {
-                    ordinal: 7,
-                    data: serde_json::json!({ "why": "no" }),
-                }
-            }
-        }
+    fn a_delay_behaviour_surfaces_as_an_after_step() {
         let d = GenericDispatch::new(chat_proto());
+        let schema = chat_schema();
         let mut behaviors: BehaviorMap = HashMap::new();
-        behaviors.insert("send".into(), Box::new(Raise));
+        behaviors.insert(
+            "send".into(),
+            BehaviorKind::Delay.make(
+                &serde_json::json!({ "ms": 500, "value": null }),
+                &chat_proto().functions[0],
+                &schema,
+            ),
+        );
 
-        let (outcome, body) = run(&d, RequestCall::Id(0), &Value::Null, &mut behaviors).unwrap();
-        assert_eq!(outcome, Outcome::Err(7));
-        assert_eq!(body, serde_json::json!({ "why": "no" }));
+        assert_eq!(
+            step(&d, RequestCall::Id(0), &Value::Null, &mut behaviors).unwrap(),
+            BehaviorStep::After {
+                delay_ms: 500.0,
+                outcome: SimOutcome::Ok(Value::Null)
+            }
+        );
     }
 }
