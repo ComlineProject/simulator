@@ -73,15 +73,23 @@ impl Tap {
     }
 
     /// Record `bytes` crossing `from` → `to` at clock time `at`, tagged with an
-    /// optional `fault` note. Returns the new frame's `seq`.
+    /// optional `fault` note. `kind_hint` is the sender's known direction — used
+    /// unless the bytes are unambiguously a handshake (a binary datagram request
+    /// and response are otherwise indistinguishable). Returns the new frame's
+    /// `seq`.
     pub fn record(
         &mut self,
         from: impl Into<String>,
         to: impl Into<String>,
         bytes: &[u8],
         at: f64,
+        kind_hint: FrameKind,
         fault: Option<String>,
     ) -> u32 {
+        let kind = match classify(bytes) {
+            FrameKind::Handshake => FrameKind::Handshake,
+            _ => kind_hint,
+        };
         self.counter += 1;
         self.frames.push(Frame {
             seq: self.counter,
@@ -89,7 +97,7 @@ impl Tap {
             to: to.into(),
             bytes: bytes.to_vec(),
             at,
-            kind: classify(bytes),
+            kind,
             fault,
         });
         self.counter
@@ -136,25 +144,44 @@ mod tests {
     #[test]
     fn tap_numbers_frames_and_keeps_them_in_order() {
         let mut tap = Tap::new();
-        let s1 = tap.record("a", "b", &[1, 2, 3], 0.0, None);
-        let s2 = tap.record("b", "a", &[4, 5], 1.0, Some("dropped".into()));
+        let s1 = tap.record("a", "b", &[1, 2, 3], 0.0, FrameKind::Request, None);
+        let s2 = tap.record(
+            "b",
+            "a",
+            &[4, 5],
+            1.0,
+            FrameKind::Response,
+            Some("dropped".into()),
+        );
 
         assert_eq!((s1, s2), (1, 2));
         assert_eq!(tap.frames.len(), 2);
         assert_eq!(tap.frames[0].from, "a");
         assert_eq!(tap.frames[0].bytes, vec![1, 2, 3]);
+        assert_eq!(
+            tap.frames[1].kind,
+            FrameKind::Response,
+            "the hint stands for a datagram"
+        );
         assert_eq!(tap.frames[1].fault.as_deref(), Some("dropped"));
 
         tap.clear();
         assert!(tap.frames.is_empty());
         // the counter keeps climbing after a clear
-        assert_eq!(tap.record("a", "b", &[], 2.0, None), 3);
+        assert_eq!(tap.record("a", "b", &[], 2.0, FrameKind::Request, None), 3);
+    }
+
+    #[test]
+    fn a_handshake_ignores_the_direction_hint() {
+        let mut tap = Tap::new();
+        tap.record("a", "b", &handshake_frame(), 0.0, FrameKind::Request, None);
+        assert_eq!(tap.frames[0].kind, FrameKind::Handshake);
     }
 
     #[test]
     fn frame_serializes_without_a_null_fault() {
         let mut tap = Tap::new();
-        tap.record("a", "b", &[9], 0.0, None);
+        tap.record("a", "b", &[9], 0.0, FrameKind::Request, None);
         let json = serde_json::to_string(&tap.frames[0]).unwrap();
         assert!(!json.contains("fault"), "{json}");
         assert!(json.contains("\"kind\":\"request\""), "{json}");

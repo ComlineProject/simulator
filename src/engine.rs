@@ -7,8 +7,9 @@
 //! inner call's request id, with a `forwarding` set as the cycle guard — the
 //! same shape as `Wires.forwardVia`, without parking a stack frame.
 //!
-//! Not yet ported: the client call timeout / `dead` desync (2c) and
-//! `replay_recording` — both land in the next slice.
+//! A call with no reply inside its connection's timeout window settles as
+//! [`CallResult::Timeout`] and the wire goes [`dead`](Engine::connection_dead)
+//! (2c) — reopen it with [`Engine::rebuild`].
 //!
 //! [`Clock`]: crate::clock::Clock
 
@@ -40,6 +41,9 @@ pub enum CallResult {
     /// The response frame arrived but its body would not decode — e.g. a
     /// corrupted wire. The call never gets a clean value.
     Undecodable(String),
+    /// No reply within the connection's call-timeout window. The wire is left
+    /// `dead` — see [`Engine::connection_dead`].
+    Timeout,
 }
 
 /// A scheduled step of the simulation, tagged with the connection it belongs to.
@@ -61,6 +65,12 @@ enum Event {
         request_id: u64,
         outcome: SimOutcome,
     },
+    /// A call's timeout window elapsed. If it hasn't settled, it times out and
+    /// its wire goes `dead`.
+    Timeout {
+        conn: String,
+        request_id: u64,
+    },
 }
 
 fn deliver_event(conn: String, dir: Direction, frame: Vec<u8>) -> Event {
@@ -81,6 +91,12 @@ struct Wire {
     /// `None` when connected; otherwise why it was refused (`"handshake"` for a
     /// version / framing / wire-format mismatch).
     error: Option<String>,
+    /// How long a call on this wire waits for its reply before timing out.
+    /// `0` = wait forever.
+    timeout_ms: f64,
+    /// Set once a call has timed out — the client half is desynced, every later
+    /// call fails fast until the connection is reopened.
+    dead: bool,
 }
 
 /// A forwarded call in flight: when the inner call settles, answer the outer one.
@@ -98,6 +114,11 @@ pub struct Engine {
     results: HashMap<u64, CallResult>,
     forwards: HashMap<u64, ForwardCont>,
     forwarding: HashSet<String>,
+    /// Requests issued and not yet settled — the timeout only fires for these.
+    in_flight: HashSet<u64>,
+    /// request id → the clock handle of its pending timeout, so settling a call
+    /// early cancels it (otherwise a far-future timeout keeps the sim "busy").
+    timeouts: HashMap<u64, u64>,
 }
 
 impl Default for Engine {
@@ -116,6 +137,8 @@ impl Engine {
             results: HashMap::new(),
             forwards: HashMap::new(),
             forwarding: HashSet::new(),
+            in_flight: HashSet::new(),
+            timeouts: HashMap::new(),
         }
     }
 
@@ -142,6 +165,8 @@ impl Engine {
         self.wires.clear();
         self.forwards.clear();
         self.forwarding.clear();
+        self.in_flight.clear();
+        self.timeouts.clear();
         self.rng = Mulberry32::new(session.seed);
         self.sync(session);
     }
@@ -184,6 +209,8 @@ impl Engine {
             server_id: server.id.clone(),
             framing: DatagramFraming,
             error,
+            timeout_ms: session.call_timeout_ms.max(0.0),
+            dead: false,
         }
     }
 
@@ -251,6 +278,12 @@ impl Engine {
         self.wires.get(conn_id).and_then(|w| w.error.as_deref())
     }
 
+    /// True once a call on this connection has timed out — it is desynced and
+    /// must be reopened ([`Engine::rebuild`]).
+    pub fn connection_dead(&self, conn_id: &str) -> bool {
+        self.wires.get(conn_id).is_some_and(|w| w.dead)
+    }
+
     pub fn connection_ids(&self) -> impl Iterator<Item = &str> {
         self.wires.keys().map(String::as_str)
     }
@@ -280,6 +313,9 @@ impl Engine {
         if wire.error.is_some() {
             return Err(RuntimeError::Handshake);
         }
+        if wire.dead {
+            return Err(RuntimeError::Timeout);
+        }
         let function = wire
             .dispatch
             .protocol()
@@ -289,6 +325,7 @@ impl Engine {
             .ok_or(RuntimeError::UnknownCall)?;
         let call_id = function.index as u16;
         let one_way = function.oneway;
+        let timeout_ms = wire.timeout_ms;
 
         self.next_request_id += 1;
         let id = self.next_request_id;
@@ -299,6 +336,18 @@ impl Engine {
         self.emit(conn_id, Direction::Request, frame);
         if one_way {
             self.results.insert(id, CallResult::Ok(Value::Null));
+        } else {
+            self.in_flight.insert(id);
+            if timeout_ms > 0.0 {
+                let handle = self.clock.schedule(
+                    timeout_ms,
+                    Event::Timeout {
+                        conn: conn_id.to_string(),
+                        request_id: id,
+                    },
+                );
+                self.timeouts.insert(id, handle);
+            }
         }
         Ok(id)
     }
@@ -351,6 +400,7 @@ impl Engine {
                 request_id,
                 outcome,
             } => self.reply_now(&conn, request_id, outcome),
+            Event::Timeout { conn, request_id } => self.time_out(&conn, request_id),
         }
     }
 
@@ -403,14 +453,16 @@ impl Engine {
 
         match step {
             BehaviorStep::Now(outcome) => self.reply_now(conn_id, request_id, outcome),
-            BehaviorStep::After { delay_ms, outcome } => self.clock.schedule(
-                delay_ms,
-                Event::CompleteReply {
-                    conn: conn_id.to_string(),
-                    request_id,
-                    outcome,
-                },
-            ),
+            BehaviorStep::After { delay_ms, outcome } => {
+                self.clock.schedule(
+                    delay_ms,
+                    Event::CompleteReply {
+                        conn: conn_id.to_string(),
+                        request_id,
+                        outcome,
+                    },
+                );
+            }
             BehaviorStep::Hang => {}
             BehaviorStep::Forward {
                 via,
@@ -476,7 +528,14 @@ impl Engine {
     }
 
     /// Settle a call — either resume the forward waiting on it, or record it.
+    /// First settlement wins: a late frame after a timeout is ignored.
     fn settle(&mut self, request_id: u64, result: CallResult) {
+        if !self.in_flight.remove(&request_id) {
+            return;
+        }
+        if let Some(handle) = self.timeouts.remove(&request_id) {
+            self.clock.cancel(handle);
+        }
         if let Some(cont) = self.forwards.remove(&request_id) {
             self.forwarding.remove(&cont.via);
             let outcome = match result {
@@ -489,11 +548,28 @@ impl Engine {
                     ordinal: 0,
                     data: json!({ "error": msg }),
                 },
+                CallResult::Timeout => SimOutcome::Err {
+                    ordinal: 0,
+                    data: json!({ "error": "forward: upstream timed out" }),
+                },
             };
             self.reply_now(&cont.outer_conn, cont.outer_request_id, outcome);
         } else {
             self.results.insert(request_id, result);
         }
+    }
+
+    /// A call's timeout window elapsed: if it is still in flight, time it out and
+    /// leave its wire `dead`.
+    fn time_out(&mut self, conn_id: &str, request_id: u64) {
+        if !self.in_flight.contains(&request_id) {
+            return;
+        }
+        self.timeouts.remove(&request_id); // this event *is* the timeout — nothing to cancel
+        if let Some(wire) = self.wires.get_mut(conn_id) {
+            wire.dead = true;
+        }
+        self.settle(request_id, CallResult::Timeout);
     }
 
     /// Relay the outer call on `via`, then answer it with the inner outcome.
@@ -799,8 +875,9 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_request_never_settles() {
+    fn a_dropped_request_never_settles_without_a_timeout() {
         let mut session = chat::session();
+        session.call_timeout_ms = 0.0; // wait forever — isolate the drop path
         session.connections[0].faults.drop_prob = 1.0;
         session.connections[0].faults.apply_to = FaultDir::Requests;
         let mut e = Engine::new();
@@ -963,5 +1040,106 @@ mod tests {
         };
         assert_eq!(frames_for(7), frames_for(7));
         assert_ne!(frames_for(7), frames_for(8));
+    }
+
+    #[test]
+    fn a_dropped_reply_times_the_call_out_and_kills_the_wire() {
+        let mut session = chat::session();
+        session.call_timeout_ms = 120.0;
+        session.connections[0].faults.drop_prob = 1.0;
+        session.connections[0].faults.apply_to = FaultDir::Responses;
+        let mut e = Engine::new();
+        e.sync(&session);
+
+        let id = e.call(CONN, "send", &json!(["x"])).unwrap();
+        e.run();
+
+        assert_eq!(e.result(id), Some(&CallResult::Timeout));
+        assert!(e.connection_dead(CONN));
+        assert_eq!(e.now(), 120.0, "settled at the timeout instant");
+        // a dead wire fails every later call fast
+        assert_eq!(
+            e.call(CONN, "send", &json!(["y"])).unwrap_err(),
+            RuntimeError::Timeout
+        );
+    }
+
+    #[test]
+    fn rebuild_recovers_a_dead_wire() {
+        let mut session = chat::session();
+        session.call_timeout_ms = 120.0;
+        session.connections[0].faults.drop_prob = 1.0;
+        session.connections[0].faults.apply_to = FaultDir::Responses;
+        let mut e = Engine::new();
+        e.sync(&session);
+        e.call(CONN, "send", &json!(["x"])).unwrap();
+        e.run();
+        assert!(e.connection_dead(CONN));
+
+        session.connections[0].faults.drop_prob = 0.0;
+        e.rebuild(&session);
+        assert!(!e.connection_dead(CONN));
+
+        let id = e.call(CONN, "send", &json!(["x"])).unwrap();
+        e.run();
+        assert_eq!(e.result(id), Some(&CallResult::Ok(hello())));
+    }
+
+    #[test]
+    fn a_zero_timeout_waits_forever() {
+        let mut session = chat::session();
+        session.call_timeout_ms = 0.0;
+        session.connections[0].faults.drop_prob = 1.0;
+        session.connections[0].faults.apply_to = FaultDir::Responses;
+        let mut e = Engine::new();
+        e.sync(&session);
+
+        let id = e.call(CONN, "send", &json!(["x"])).unwrap();
+        e.advance(1_000_000.0);
+        assert_eq!(e.result(id), None, "never settles, never dies");
+        assert!(!e.connection_dead(CONN));
+    }
+
+    #[test]
+    fn a_forward_whose_upstream_hangs_times_out_and_kills_both_wires() {
+        let mut session = chat::session(); // chat-1 (backend), chat-2, c1
+        session.call_timeout_ms = 150.0;
+        let backend = session
+            .instances
+            .iter()
+            .find(|i| i.role == Role::Server)
+            .unwrap()
+            .id
+            .clone();
+        // make the backend never reply
+        session
+            .set_behavior(&backend, "send", BehaviorKind::Drop, Some(json!({})))
+            .unwrap();
+
+        let gw_client = session.add_instance(client_instance(Role::Client), Placement::default());
+        let c_gw_backend = session.add_connection(&gw_client, &backend).unwrap();
+        let gw_server = session.add_instance(client_instance(Role::Server), Placement::default());
+        let outer_client =
+            session.add_instance(client_instance(Role::Client), Placement::default());
+        let c_outer = session.add_connection(&outer_client, &gw_server).unwrap();
+        session
+            .set_behavior(
+                &gw_server,
+                "send",
+                BehaviorKind::Forward,
+                Some(json!({ "viaConnectionId": c_gw_backend, "targetFn": "send" })),
+            )
+            .unwrap();
+
+        let mut e = Engine::new();
+        e.sync(&session);
+        let id = e.call(&c_outer, "send", &json!(["relay"])).unwrap();
+        e.run();
+
+        // the outer client's own timeout fires first (one session-wide window,
+        // and it was scheduled before the nested inner call) — same as the TS
+        assert_eq!(e.result(id), Some(&CallResult::Timeout));
+        assert!(e.connection_dead(&c_outer), "the outer wire is dead");
+        assert!(e.connection_dead(&c_gw_backend), "so is the hung upstream");
     }
 }

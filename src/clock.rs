@@ -82,15 +82,28 @@ impl<E> Clock<E> {
         to_millis(self.now)
     }
 
-    /// Queue `event` to fire `delay_ms` from now (clamped to ≥ 0).
-    pub fn schedule(&mut self, delay_ms: f64, event: E) {
+    /// Queue `event` to fire `delay_ms` from now (clamped to ≥ 0). Returns a
+    /// handle to [`cancel`](Self::cancel) it with.
+    pub fn schedule(&mut self, delay_ms: f64, event: E) -> u64 {
         let due = self.now + to_micros(delay_ms.max(0.0));
         self.seq += 1;
+        let handle = self.seq;
         self.queue.push(Scheduled {
             due,
-            seq: self.seq,
+            seq: handle,
             event,
         });
+        handle
+    }
+
+    /// Drop the queued event with this handle, if it hasn't fired. A no-op
+    /// otherwise.
+    pub fn cancel(&mut self, handle: u64) {
+        let kept: BinaryHeap<Scheduled<E>> = std::mem::take(&mut self.queue)
+            .into_iter()
+            .filter(|s| s.seq != handle)
+            .collect();
+        self.queue = kept;
     }
 
     /// Timers queued and not yet fired.
@@ -160,6 +173,18 @@ mod tests {
         assert_eq!(c.peek_due(), Some(15.0));
         c.pop_next();
         assert_eq!(c.now(), 15.0);
+    }
+
+    #[test]
+    fn cancel_removes_a_pending_event_by_handle() {
+        let mut c: Clock<&str> = Clock::new();
+        c.schedule(10.0, "a");
+        let h = c.schedule(20.0, "b");
+        c.schedule(30.0, "c");
+        c.cancel(h);
+        c.cancel(9999); // unknown handle → no-op
+
+        assert_eq!(drain(&mut c), ["a", "c"]);
     }
 
     #[test]

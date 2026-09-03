@@ -92,24 +92,34 @@ impl Channel {
             Direction::Request => (self.client_name.clone(), self.server_name.clone()),
             Direction::Response => (self.server_name.clone(), self.client_name.clone()),
         };
+        let hint = match dir {
+            Direction::Request => FrameKind::Request,
+            Direction::Response => FrameKind::Response,
+        };
         let is_handshake = classify(bytes) == FrameKind::Handshake;
 
         // Partition cuts everything, handshakes included.
         if self.faults.partition {
-            self.tap
-                .record(from, to, bytes, now, Some("dropped · partition".into()));
+            self.tap.record(
+                from,
+                to,
+                bytes,
+                now,
+                hint,
+                Some("dropped · partition".into()),
+            );
             return SendOutcome::Dropped;
         }
 
         // Handshakes and out-of-scope directions only see the latency knob.
         if is_handshake || !fault_applies_to(&self.faults, dir) {
-            self.tap.record(from, to, bytes, now, None);
+            self.tap.record(from, to, bytes, now, hint, None);
             return SendOutcome::deliver_one(bytes.to_vec(), self.latency_ms);
         }
 
         if rng.chance(self.faults.drop_prob) {
             self.tap
-                .record(from, to, bytes, now, Some("dropped".into()));
+                .record(from, to, bytes, now, hint, Some("dropped".into()));
             return SendOutcome::Dropped;
         }
 
@@ -133,7 +143,7 @@ impl Channel {
         }
 
         let note = (!notes.is_empty()).then(|| notes.join(" · "));
-        self.tap.record(from, to, &out, now, note);
+        self.tap.record(from, to, &out, now, hint, note);
 
         if self.faults.reorder_window > 0 {
             self.reorder_buf.push(out);
