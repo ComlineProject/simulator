@@ -23,7 +23,7 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin
             target
-          key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.toml') }}
+          key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.lock') }}
 
       - name: Test (native)
         run: cargo test
