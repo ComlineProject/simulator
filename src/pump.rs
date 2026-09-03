@@ -15,11 +15,11 @@
 use std::collections::HashMap;
 
 use comline_runtime::contract::{
-    Call, DatagramFraming, Envelope, Framing, Outcome, Reply, RuntimeError, WireFormat,
+    Call, DatagramFraming, Envelope, Framing, RuntimeError, WireFormat,
 };
 use serde_json::Value;
 
-use crate::behavior::{Behavior, ReplyWith};
+use crate::behavior::{Behavior, BehaviorStep, ReplyWith, SimOutcome};
 use crate::clock::Clock;
 use crate::faults::{Direction, FaultSpec};
 use crate::format::Json;
@@ -52,6 +52,11 @@ enum Event {
     DeliverToClient(Vec<u8>),
     /// A connection's reorder buffer should be released now.
     FlushReorder(Direction),
+    /// A `delay` behaviour's timer elapsed — frame and send its reply now.
+    CompleteReply {
+        request_id: u64,
+        outcome: SimOutcome,
+    },
 }
 
 /// The delivery event a frame travelling in `dir` turns into.
@@ -255,42 +260,75 @@ impl Pump {
                     self.clock.schedule(0.0, deliver_event(dir, f));
                 }
             }
+            Event::CompleteReply {
+                request_id,
+                outcome,
+            } => self.reply_now(request_id, outcome),
         }
     }
 
-    /// Server side: decode the request, dispatch it, frame the response, and put
-    /// it back on the wire.
+    /// Server side: decode the request, run its behaviour, and act on the step —
+    /// reply now, schedule a delayed reply, hang, or (with no engine to relay
+    /// on) answer a `forward` with the "only in the engine" error.
     fn serve(&mut self, request_frame: &[u8]) {
         let Some(req) = self.framing.decode_request(request_frame) else {
             return;
         };
         let request_id = req.request_id;
 
-        let mut body = Vec::new();
-        let outcome = {
-            let mut reply = Reply::new(&mut body);
-            match self.dispatch.dispatch(
-                req.call,
-                req.params,
-                &self.fmt,
-                &mut self.behaviors,
-                &mut reply,
-            ) {
-                Ok(()) => reply.outcome(),
-                // a schema-less dispatch failure — no response, the call times out
+        let step =
+            match self
+                .dispatch
+                .dispatch(req.call, req.params, &self.fmt, &mut self.behaviors)
+            {
+                Ok(step) => step,
+                // unknown call / undecodable params — no response, the call times out
                 Err(_) => return,
-            }
-        };
+            };
 
+        match step {
+            BehaviorStep::Now(outcome) => self.reply_now(request_id, outcome),
+            BehaviorStep::After { delay_ms, outcome } => {
+                self.clock.schedule(
+                    delay_ms,
+                    Event::CompleteReply {
+                        request_id,
+                        outcome,
+                    },
+                );
+            }
+            BehaviorStep::Hang => {} // client's call stays pending, like a dead peer
+            BehaviorStep::Forward { .. } => self.reply_now(
+                request_id,
+                SimOutcome::Err {
+                    ordinal: 0,
+                    data: serde_json::json!({ "error": "forwarding is only available in the engine" }),
+                },
+            ),
+        }
+    }
+
+    /// Frame `outcome` as a response to `request_id` and put it on the wire.
+    fn reply_now(&mut self, request_id: u64, outcome: SimOutcome) {
         let mut resp = Vec::new();
         match outcome {
-            Outcome::Ok => self
-                .framing
-                .encode_response_ok(request_id, &body, &mut resp),
-            Outcome::Err(id) => self
-                .framing
-                .encode_response_err(request_id, id, &body, &mut resp),
-            Outcome::None => return, // one-way — nothing to send back
+            SimOutcome::Ok(value) => {
+                let mut body = Vec::new();
+                if self.fmt.encode(&value, &mut body).is_err() {
+                    return;
+                }
+                self.framing
+                    .encode_response_ok(request_id, &body, &mut resp);
+            }
+            SimOutcome::Err { ordinal, data } => {
+                let mut body = Vec::new();
+                if self.fmt.encode(&data, &mut body).is_err() {
+                    return;
+                }
+                self.framing
+                    .encode_response_err(request_id, ordinal, &body, &mut resp);
+            }
+            SimOutcome::None => return, // one-way — nothing to send back
         }
         self.emit(Direction::Response, resp);
     }
@@ -387,11 +425,19 @@ fn chat_shape() -> ProjectShape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behavior::Echo;
+    use crate::behavior::{BehaviorKind, Echo};
     use serde_json::json;
 
     fn hello() -> Value {
         json!({ "body": "HELLO", "seq": 1 })
+    }
+
+    /// The `send` function + its schema, for building behaviours in tests.
+    fn chat_send() -> (crate::shape::SchemaShape, crate::shape::FnShape) {
+        let shape = chat_shape();
+        let schema = shape.schemas.into_iter().next().unwrap();
+        let function = schema.protocols[0].functions[0].clone();
+        (schema, function)
     }
 
     #[test]
@@ -552,5 +598,120 @@ mod tests {
         };
         assert_eq!(frames_for(7), frames_for(7));
         assert_ne!(frames_for(7), frames_for(8));
+    }
+
+    #[test]
+    fn a_delay_behaviour_defers_the_reply_in_virtual_time() {
+        let (schema, function) = chat_send();
+        let mut pump = Pump::new();
+        pump.set_latency(20.0);
+        pump.set_behavior(
+            "send",
+            BehaviorKind::Delay.make(&json!({ "ms": 500, "value": hello() }), &function, &schema),
+        );
+
+        let id = pump.call("send", &json!(["hi"])).unwrap();
+
+        pump.advance(100.0); // request lands at 20, delay timer set for 520
+        assert_eq!(pump.result(id), None);
+
+        pump.advance(1000.0);
+        assert_eq!(pump.result(id), Some(&CallResult::Ok(hello())));
+        // request delivered (20) + behaviour delay (500) + response delivered (20)
+        assert_eq!(pump.tap().frames[1].at, 520.0);
+        assert_eq!(pump.now(), 1100.0);
+    }
+
+    #[test]
+    fn a_drop_behaviour_hangs_the_call() {
+        let (schema, function) = chat_send();
+        let mut pump = Pump::new();
+        pump.set_behavior(
+            "send",
+            BehaviorKind::Drop.make(&json!({}), &function, &schema),
+        );
+
+        let id = pump.call("send", &json!(["hi"])).unwrap();
+        pump.run();
+
+        assert_eq!(pump.result(id), None, "no reply ever comes");
+        assert_eq!(pump.tap().frames.len(), 1, "only the request was sent");
+    }
+
+    #[test]
+    fn a_raise_behaviour_settles_the_call_as_an_error() {
+        let (schema, function) = chat_send();
+        let mut pump = Pump::new();
+        pump.set_behavior(
+            "send",
+            BehaviorKind::Raise.make(
+                &json!({ "ordinal": 3, "data": { "why": "nope" } }),
+                &function,
+                &schema,
+            ),
+        );
+
+        let id = pump.call("send", &json!(["hi"])).unwrap();
+        pump.run();
+
+        assert_eq!(
+            pump.result(id),
+            Some(&CallResult::Err {
+                ordinal: 3,
+                body: json!({ "why": "nope" })
+            })
+        );
+    }
+
+    #[test]
+    fn increment_bumps_the_reply_across_calls() {
+        let (schema, function) = chat_send();
+        let mut pump = Pump::new();
+        pump.set_behavior(
+            "send",
+            BehaviorKind::Increment.make(
+                &json!({ "base": { "body": "", "seq": 0 }, "path": "seq" }),
+                &function,
+                &schema,
+            ),
+        );
+
+        let a = pump.call("send", &json!(["hi"])).unwrap();
+        pump.run();
+        let b = pump.call("send", &json!(["hi"])).unwrap();
+        pump.run();
+
+        assert_eq!(
+            pump.result(a),
+            Some(&CallResult::Ok(json!({ "body": "", "seq": 1 })))
+        );
+        assert_eq!(
+            pump.result(b),
+            Some(&CallResult::Ok(json!({ "body": "", "seq": 2 })))
+        );
+    }
+
+    #[test]
+    fn a_forward_behaviour_without_an_engine_errors() {
+        let (schema, function) = chat_send();
+        let mut pump = Pump::new();
+        pump.set_behavior(
+            "send",
+            BehaviorKind::Forward.make(
+                &json!({ "viaConnectionId": "c2", "targetFn": "send" }),
+                &function,
+                &schema,
+            ),
+        );
+
+        let id = pump.call("send", &json!(["hi"])).unwrap();
+        pump.run();
+
+        match pump.result(id) {
+            Some(CallResult::Err { ordinal: 0, body }) => {
+                assert!(body["error"].as_str().unwrap().contains("engine"));
+            }
+            other => panic!("expected an engine error, got {other:?}"),
+        }
     }
 }

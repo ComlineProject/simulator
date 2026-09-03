@@ -1,16 +1,20 @@
 //! What a simulated server instance does for one function when a call arrives.
-//! Ported from the playground's `behavior.ts` — for now just the trait, the
-//! outcome type, and the two trivial behaviours needed to exercise
-//! [`GenericDispatch`](crate::generic::GenericDispatch). The full canned
-//! catalogue (`increment`, `delay`, `raise`, `drop`, `forward`) and the
-//! Rhai-scripted behaviour land in later slices.
+//! Ported from the playground's `behavior.ts`: the [`Behavior`] trait, the
+//! canned catalogue keyed by [`BehaviorKind`] (label / applies-to / default
+//! config / factory), and `default_kind_for`.
+//!
+//! The async parts of the TS version fold into the [`BehaviorStep`] a `run`
+//! returns: `delay` yields [`BehaviorStep::After`] and the pump schedules the
+//! reply on the clock; `drop` yields [`BehaviorStep::Hang`]; `forward` yields
+//! [`BehaviorStep::Forward`] and the engine relays it (until the `engine` port
+//! the pump answers it with the same "only in the engine" error the TS does).
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use crate::shape::{FnShape, ProtocolShape};
+use crate::shape::{is_numeric_prim, FnShape, SchemaShape, TypeDef, TypeRef};
 
-/// What a behaviour produced for one call. The dispatcher turns this into the
-/// response frame — `Ok` / `Err` envelope, or nothing for a one-way call.
+/// What a behaviour produced for one call. The success / error *value* is fixed
+/// when `run` returns; only *when* it is sent varies.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SimOutcome {
     /// A success value (`Value::Null` for a unit return).
@@ -21,18 +25,35 @@ pub enum SimOutcome {
     None,
 }
 
+/// What the pump should do with a dispatched call.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BehaviorStep {
+    /// Reply now.
+    Now(SimOutcome),
+    /// Reply after `delay_ms` of clock time.
+    After { delay_ms: f64, outcome: SimOutcome },
+    /// Never reply — the client's call hangs, like a dead peer.
+    Hang,
+    /// Relay this call over another connection, then reply with its outcome.
+    /// Handled by the engine; the bare pump can't (no other wire to relay on).
+    Forward {
+        via: String,
+        target_fn: String,
+        params: Value,
+    },
+}
+
 /// The context a behaviour runs against.
 pub struct BehaviorCtx<'a> {
     /// The decoded request params (`Value::Null` when the call takes none).
     pub params: Value,
     pub function: &'a FnShape,
-    pub protocol: &'a ProtocolShape,
-    // later slices: `forward` (relay to another wire) and `clock` (for `delay`)
+    pub protocol: &'a crate::shape::ProtocolShape,
 }
 
 /// A server instance's handler for one function.
 pub trait Behavior {
-    fn run(&mut self, ctx: BehaviorCtx<'_>) -> SimOutcome;
+    fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep;
 }
 
 /// `Ok(value)` for a normal function, `None` for a one-way one.
@@ -44,81 +65,564 @@ fn ok_or_none(function: &FnShape, value: Value) -> SimOutcome {
     }
 }
 
+// ── the canned behaviours ────────────────────────────────────────────────
+
 /// "Reply with value" — always answers with a fixed value.
 pub struct ReplyWith {
     pub value: Value,
 }
-
 impl Behavior for ReplyWith {
-    fn run(&mut self, ctx: BehaviorCtx<'_>) -> SimOutcome {
-        ok_or_none(ctx.function, self.value.clone())
+    fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep {
+        BehaviorStep::Now(ok_or_none(ctx.function, self.value.clone()))
     }
 }
 
 /// "Echo params" — answers with the request params verbatim.
 pub struct Echo;
-
 impl Behavior for Echo {
-    fn run(&mut self, ctx: BehaviorCtx<'_>) -> SimOutcome {
+    fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep {
         let params = ctx.params.clone();
-        ok_or_none(ctx.function, params)
+        BehaviorStep::Now(ok_or_none(ctx.function, params))
+    }
+}
+
+/// "Increment field" — a running value; one numeric field goes up by 1 each call.
+pub struct Increment {
+    base: Value,
+    path: String,
+    current: Option<Value>,
+}
+impl Behavior for Increment {
+    fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep {
+        let cur = self.current.get_or_insert_with(|| self.base.clone());
+        if !self.path.is_empty() {
+            let n = get_at(cur, &self.path)
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            set_at(cur, &self.path, number(n + 1.0));
+        }
+        BehaviorStep::Now(ok_or_none(ctx.function, cur.clone()))
+    }
+}
+
+/// "Delay then reply" — a fixed value, `ms` of clock time later.
+pub struct Delay {
+    ms: f64,
+    value: Value,
+}
+impl Behavior for Delay {
+    fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep {
+        BehaviorStep::After {
+            delay_ms: self.ms.max(0.0),
+            outcome: ok_or_none(ctx.function, self.value.clone()),
+        }
+    }
+}
+
+/// "Raise error" — answers with a schema error.
+pub struct Raise {
+    ordinal: u16,
+    data: Value,
+}
+impl Behavior for Raise {
+    fn run(&mut self, _ctx: BehaviorCtx<'_>) -> BehaviorStep {
+        BehaviorStep::Now(SimOutcome::Err {
+            ordinal: self.ordinal,
+            data: self.data.clone(),
+        })
+    }
+}
+
+/// "Drop (never reply)" — the call hangs.
+pub struct Drop;
+impl Behavior for Drop {
+    fn run(&mut self, _ctx: BehaviorCtx<'_>) -> BehaviorStep {
+        BehaviorStep::Hang
+    }
+}
+
+/// "Forward to another server" — relay over another connection.
+pub struct Forward {
+    via: String,
+    target_fn: String,
+}
+impl Behavior for Forward {
+    fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep {
+        if self.via.is_empty() {
+            return BehaviorStep::Now(SimOutcome::Err {
+                ordinal: 0,
+                data: serde_json::json!({ "error": "forward: pick a connection" }),
+            });
+        }
+        BehaviorStep::Forward {
+            via: self.via.clone(),
+            target_fn: if self.target_fn.is_empty() {
+                ctx.function.name.clone()
+            } else {
+                self.target_fn.clone()
+            },
+            params: ctx.params.clone(),
+        }
+    }
+}
+
+// ── the catalogue ───────────────────────────────────────────────────────
+
+/// The canned server behaviours a simulated instance can run for one function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BehaviorKind {
+    Reply,
+    Echo,
+    Increment,
+    Delay,
+    Raise,
+    Drop,
+    Forward,
+}
+
+impl BehaviorKind {
+    pub const ALL: [BehaviorKind; 7] = [
+        BehaviorKind::Reply,
+        BehaviorKind::Echo,
+        BehaviorKind::Increment,
+        BehaviorKind::Delay,
+        BehaviorKind::Raise,
+        BehaviorKind::Drop,
+        BehaviorKind::Forward,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BehaviorKind::Reply => "Reply with value",
+            BehaviorKind::Echo => "Echo params",
+            BehaviorKind::Increment => "Increment field",
+            BehaviorKind::Delay => "Delay then reply",
+            BehaviorKind::Raise => "Raise error",
+            BehaviorKind::Drop => "Drop (never reply)",
+            BehaviorKind::Forward => "Forward to another server",
+        }
+    }
+
+    /// Whether this behaviour makes sense for `function`.
+    pub fn applies_to(self, function: &FnShape) -> bool {
+        match self {
+            BehaviorKind::Reply | BehaviorKind::Echo | BehaviorKind::Delay | BehaviorKind::Drop => {
+                true
+            }
+            BehaviorKind::Increment => {
+                !function.oneway && matches!(function.returns, Some(TypeRef::Ref { .. }))
+            }
+            BehaviorKind::Raise => !function.throws.is_empty(),
+            BehaviorKind::Forward => !function.oneway,
+        }
+    }
+
+    /// A starting config for `function`, seeded from its return / error types.
+    pub fn default_config(self, function: &FnShape, schema: &SchemaShape) -> Value {
+        let zero_return = || {
+            function
+                .returns
+                .as_ref()
+                .map_or(Value::Null, |r| crate::shape::zero_value(r, &schema.types))
+        };
+        match self {
+            BehaviorKind::Reply => serde_json::json!({ "value": zero_return() }),
+            BehaviorKind::Echo | BehaviorKind::Drop => serde_json::json!({}),
+            BehaviorKind::Increment => serde_json::json!({
+                "base": zero_return(),
+                "path": first_numeric_path(function, schema).unwrap_or_default(),
+            }),
+            BehaviorKind::Delay => serde_json::json!({ "ms": 400, "value": zero_return() }),
+            BehaviorKind::Raise => {
+                let first = function.throws.first();
+                let ordinal = first.map_or(0, |t| t.ordinal);
+                let mut data = Map::new();
+                if let Some(err) = schema
+                    .errors
+                    .iter()
+                    .find(|e| Some(e.ordinal) == first.map(|t| t.ordinal))
+                {
+                    for f in &err.fields {
+                        data.insert(
+                            f.name.clone(),
+                            crate::shape::zero_value(&f.ty, &schema.types),
+                        );
+                    }
+                }
+                serde_json::json!({ "ordinal": ordinal, "data": Value::Object(data) })
+            }
+            BehaviorKind::Forward => {
+                serde_json::json!({ "viaConnectionId": "", "targetFn": function.name })
+            }
+        }
+    }
+
+    /// Build the runnable behaviour from a (possibly partial) config.
+    pub fn make(
+        self,
+        config: &Value,
+        function: &FnShape,
+        _schema: &SchemaShape,
+    ) -> Box<dyn Behavior> {
+        let get = |key: &str| config.get(key).cloned().unwrap_or(Value::Null);
+        match self {
+            BehaviorKind::Reply => Box::new(ReplyWith {
+                value: get("value"),
+            }),
+            BehaviorKind::Echo => Box::new(Echo),
+            BehaviorKind::Increment => Box::new(Increment {
+                base: match get("base") {
+                    Value::Null => Value::Object(Map::new()),
+                    other => other,
+                },
+                path: get("path").as_str().unwrap_or_default().to_string(),
+                current: None,
+            }),
+            BehaviorKind::Delay => Box::new(Delay {
+                ms: get("ms").as_f64().unwrap_or(0.0),
+                value: get("value"),
+            }),
+            BehaviorKind::Raise => Box::new(Raise {
+                ordinal: get("ordinal").as_u64().unwrap_or(0) as u16,
+                data: get("data"),
+            }),
+            BehaviorKind::Drop => Box::new(Drop),
+            BehaviorKind::Forward => Box::new(Forward {
+                via: get("viaConnectionId")
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                target_fn: get("targetFn")
+                    .as_str()
+                    .unwrap_or(&function.name)
+                    .to_string(),
+            }),
+        }
+    }
+}
+
+/// The behaviour a freshly-added server function starts on.
+pub fn default_kind_for(function: &FnShape) -> BehaviorKind {
+    if function.oneway {
+        BehaviorKind::Drop
+    } else {
+        BehaviorKind::Reply
+    }
+}
+
+// ── helpers ─────────────────────────────────────────────────────────────
+
+/// The first numeric-primitive field path of a struct return, for `increment`.
+fn first_numeric_path(function: &FnShape, schema: &SchemaShape) -> Option<String> {
+    let TypeRef::Ref { name } = function.returns.as_ref()? else {
+        return None;
+    };
+    let def = schema.types.iter().find(|t| t.name() == name)?;
+    let TypeDef::Struct { fields, .. } = def else {
+        return None;
+    };
+    fields
+        .iter()
+        .find(|f| matches!(&f.ty, TypeRef::Prim { name } if is_numeric_prim(name)))
+        .map(|f| f.name.clone())
+}
+
+/// `serde_json` keeps integers exact; keep whole increments looking like ints.
+fn number(n: f64) -> Value {
+    if n.fract() == 0.0 && n.abs() < 9.007e15 {
+        Value::from(n as i64)
+    } else {
+        Value::from(n)
+    }
+}
+
+fn get_at<'a>(obj: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.').try_fold(obj, |o, k| o.get(k))
+}
+
+fn set_at(obj: &mut Value, path: &str, value: Value) {
+    match path.split_once('.') {
+        None => {
+            if let Value::Object(m) = obj {
+                m.insert(path.to_string(), value);
+            }
+        }
+        Some((head, rest)) => {
+            if !obj.is_object() {
+                *obj = Value::Object(Map::new());
+            }
+            let child = obj
+                .as_object_mut()
+                .unwrap()
+                .entry(head.to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            set_at(child, rest, value);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shape::Framing;
+    use crate::shape::{ArgShape, FieldShape, Framing, ProtocolShape};
+    use serde_json::json;
 
-    fn proto(oneway: bool) -> ProtocolShape {
-        ProtocolShape {
+    fn schema_with(
+        functions: Vec<FnShape>,
+        types: Vec<TypeDef>,
+        errors: Vec<crate::shape::ErrorShape>,
+    ) -> (SchemaShape, ProtocolShape) {
+        let proto = ProtocolShape {
             name: "P".into(),
             framing: Framing::Datagram,
-            functions: vec![FnShape {
-                name: "f".into(),
-                index: 0,
-                oneway,
-                args: vec![],
-                returns: None,
-                throws: vec![],
+            functions,
+        };
+        let schema = SchemaShape {
+            namespace: "p".into(),
+            ir_hash: "0x0".into(),
+            protocols: vec![proto.clone()],
+            errors,
+            types,
+        };
+        (schema, proto)
+    }
+
+    fn fn_send() -> FnShape {
+        FnShape {
+            name: "send".into(),
+            index: 0,
+            oneway: false,
+            args: vec![ArgShape {
+                name: "text".into(),
+                ty: TypeRef::Prim {
+                    name: "string".into(),
+                },
             }],
+            returns: Some(TypeRef::Ref {
+                name: "Counter".into(),
+            }),
+            throws: vec![],
         }
     }
 
-    fn ctx<'a>(p: &'a ProtocolShape, params: Value) -> BehaviorCtx<'a> {
+    fn counter_type() -> TypeDef {
+        TypeDef::Struct {
+            name: "Counter".into(),
+            fields: vec![
+                FieldShape {
+                    name: "label".into(),
+                    ty: TypeRef::Prim {
+                        name: "string".into(),
+                    },
+                    optional: false,
+                },
+                FieldShape {
+                    name: "n".into(),
+                    ty: TypeRef::Prim { name: "u64".into() },
+                    optional: false,
+                },
+            ],
+        }
+    }
+
+    fn ctx<'a>(proto: &'a ProtocolShape, params: Value) -> BehaviorCtx<'a> {
         BehaviorCtx {
             params,
-            function: &p.functions[0],
-            protocol: p,
+            function: &proto.functions[0],
+            protocol: proto,
         }
     }
 
     #[test]
-    fn reply_with_returns_the_fixed_value() {
-        let p = proto(false);
-        let mut b = ReplyWith {
-            value: serde_json::json!({ "ok": true }),
+    fn default_kind_is_reply_or_drop_by_direction() {
+        let mut f = fn_send();
+        assert_eq!(default_kind_for(&f), BehaviorKind::Reply);
+        f.oneway = true;
+        assert_eq!(default_kind_for(&f), BehaviorKind::Drop);
+    }
+
+    #[test]
+    fn applies_to_gates_the_kinds() {
+        let normal = fn_send();
+        let mut oneway = fn_send();
+        oneway.oneway = true;
+        oneway.returns = None;
+        let mut prim_return = fn_send();
+        prim_return.returns = Some(TypeRef::Prim { name: "u64".into() });
+        let mut throwing = fn_send();
+        throwing.throws = vec![crate::shape::ThrowShape {
+            ordinal: 3,
+            name: "Bad".into(),
+        }];
+
+        assert!(BehaviorKind::Increment.applies_to(&normal));
+        assert!(!BehaviorKind::Increment.applies_to(&prim_return)); // needs a ref return
+        assert!(!BehaviorKind::Increment.applies_to(&oneway));
+        assert!(!BehaviorKind::Raise.applies_to(&normal));
+        assert!(BehaviorKind::Raise.applies_to(&throwing));
+        assert!(!BehaviorKind::Forward.applies_to(&oneway));
+        assert!(BehaviorKind::Reply.applies_to(&oneway));
+    }
+
+    #[test]
+    fn increment_default_config_finds_the_first_numeric_field() {
+        let (schema, _) = schema_with(vec![fn_send()], vec![counter_type()], vec![]);
+        let cfg = BehaviorKind::Increment.default_config(&fn_send(), &schema);
+        assert_eq!(cfg["path"], json!("n"));
+        assert_eq!(cfg["base"], json!({ "label": "", "n": 0 }));
+    }
+
+    #[test]
+    fn raise_default_config_seeds_the_first_throw() {
+        let err = crate::shape::ErrorShape {
+            ordinal: 5,
+            name: "TooLong".into(),
+            message: "too long".into(),
+            fields: vec![FieldShape {
+                name: "max".into(),
+                ty: TypeRef::Prim { name: "u32".into() },
+                optional: false,
+            }],
         };
+        let mut f = fn_send();
+        f.throws = vec![crate::shape::ThrowShape {
+            ordinal: 5,
+            name: "TooLong".into(),
+        }];
+        let (schema, _) = schema_with(vec![f.clone()], vec![], vec![err]);
+
+        let cfg = BehaviorKind::Raise.default_config(&f, &schema);
+        assert_eq!(cfg["ordinal"], json!(5));
+        assert_eq!(cfg["data"], json!({ "max": 0 }));
+    }
+
+    #[test]
+    fn reply_and_echo_answer_now() {
+        let (schema, proto) = schema_with(vec![fn_send()], vec![counter_type()], vec![]);
+
+        let mut reply = BehaviorKind::Reply.make(
+            &json!({ "value": { "label": "x", "n": 3 } }),
+            &proto.functions[0],
+            &schema,
+        );
         assert_eq!(
-            b.run(ctx(&p, Value::Null)),
-            SimOutcome::Ok(serde_json::json!({ "ok": true }))
+            reply.run(ctx(&proto, Value::Null)),
+            BehaviorStep::Now(SimOutcome::Ok(json!({ "label": "x", "n": 3 })))
+        );
+
+        let mut echo = BehaviorKind::Echo.make(&json!({}), &proto.functions[0], &schema);
+        assert_eq!(
+            echo.run(ctx(&proto, json!(["hi"]))),
+            BehaviorStep::Now(SimOutcome::Ok(json!(["hi"])))
         );
     }
 
     #[test]
-    fn echo_returns_the_params() {
-        let p = proto(false);
-        let mut b = Echo;
+    fn increment_bumps_the_field_each_call() {
+        let (schema, proto) = schema_with(vec![fn_send()], vec![counter_type()], vec![]);
+        let cfg = BehaviorKind::Increment.default_config(&proto.functions[0], &schema);
+        let mut b = BehaviorKind::Increment.make(&cfg, &proto.functions[0], &schema);
+
         assert_eq!(
-            b.run(ctx(&p, serde_json::json!([1, 2, 3]))),
-            SimOutcome::Ok(serde_json::json!([1, 2, 3]))
+            b.run(ctx(&proto, Value::Null)),
+            BehaviorStep::Now(SimOutcome::Ok(json!({ "label": "", "n": 1 })))
+        );
+        assert_eq!(
+            b.run(ctx(&proto, Value::Null)),
+            BehaviorStep::Now(SimOutcome::Ok(json!({ "label": "", "n": 2 })))
         );
     }
 
     #[test]
-    fn a_one_way_function_sends_nothing_back() {
-        let p = proto(true);
-        let mut b = Echo;
-        assert_eq!(b.run(ctx(&p, serde_json::json!(["x"]))), SimOutcome::None);
+    fn increment_walks_a_nested_path() {
+        let (schema, proto) = schema_with(vec![fn_send()], vec![counter_type()], vec![]);
+        let mut b = BehaviorKind::Increment.make(
+            &json!({ "base": { "stats": { "hits": 10 } }, "path": "stats.hits" }),
+            &proto.functions[0],
+            &schema,
+        );
+        assert_eq!(
+            b.run(ctx(&proto, Value::Null)),
+            BehaviorStep::Now(SimOutcome::Ok(json!({ "stats": { "hits": 11 } })))
+        );
+    }
+
+    #[test]
+    fn delay_defers_the_reply() {
+        let (schema, proto) = schema_with(vec![fn_send()], vec![counter_type()], vec![]);
+        let mut b = BehaviorKind::Delay.make(
+            &json!({ "ms": 250, "value": { "n": 1 } }),
+            &proto.functions[0],
+            &schema,
+        );
+        assert_eq!(
+            b.run(ctx(&proto, Value::Null)),
+            BehaviorStep::After {
+                delay_ms: 250.0,
+                outcome: SimOutcome::Ok(json!({ "n": 1 }))
+            }
+        );
+    }
+
+    #[test]
+    fn raise_errors_and_drop_hangs() {
+        let (schema, proto) = schema_with(vec![fn_send()], vec![], vec![]);
+        let mut raise = BehaviorKind::Raise.make(
+            &json!({ "ordinal": 4, "data": { "why": "no" } }),
+            &proto.functions[0],
+            &schema,
+        );
+        assert_eq!(
+            raise.run(ctx(&proto, Value::Null)),
+            BehaviorStep::Now(SimOutcome::Err {
+                ordinal: 4,
+                data: json!({ "why": "no" })
+            })
+        );
+
+        let mut drop = BehaviorKind::Drop.make(&json!({}), &proto.functions[0], &schema);
+        assert_eq!(drop.run(ctx(&proto, Value::Null)), BehaviorStep::Hang);
+    }
+
+    #[test]
+    fn forward_carries_the_connection_target_and_params() {
+        let (schema, proto) = schema_with(vec![fn_send()], vec![], vec![]);
+
+        let mut no_conn = BehaviorKind::Forward.make(
+            &json!({ "viaConnectionId": "", "targetFn": "send" }),
+            &proto.functions[0],
+            &schema,
+        );
+        assert!(matches!(
+            no_conn.run(ctx(&proto, Value::Null)),
+            BehaviorStep::Now(SimOutcome::Err { ordinal: 0, .. })
+        ));
+
+        let mut fwd = BehaviorKind::Forward.make(
+            &json!({ "viaConnectionId": "c2", "targetFn": "" }),
+            &proto.functions[0],
+            &schema,
+        );
+        assert_eq!(
+            fwd.run(ctx(&proto, json!(["x"]))),
+            BehaviorStep::Forward {
+                via: "c2".into(),
+                target_fn: "send".into(), // fell back to the current function name
+                params: json!(["x"])
+            }
+        );
+    }
+
+    #[test]
+    fn kind_round_trips_through_lowercase_json() {
+        for k in BehaviorKind::ALL {
+            let s = serde_json::to_string(&k).unwrap();
+            assert_eq!(serde_json::from_str::<BehaviorKind>(&s).unwrap(), k);
+        }
+        assert_eq!(
+            serde_json::to_string(&BehaviorKind::Forward).unwrap(),
+            "\"forward\""
+        );
     }
 }
