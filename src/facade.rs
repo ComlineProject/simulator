@@ -450,6 +450,28 @@ mod tests {
         assert_eq!(out["value"], json!(["echo me"]));
     }
 
+    #[cfg(feature = "script")]
+    #[test]
+    fn a_scripted_behaviour_runs_through_the_facade() {
+        let mut s = sim();
+        let srv = s
+            .try_add_instance(r#"{"schemaNs":"chat","protocol":"Chat","role":"server"}"#)
+            .unwrap();
+        let cli = s
+            .try_add_instance(r#"{"schemaNs":"chat","protocol":"Chat","role":"client"}"#)
+            .unwrap();
+        let conn = s.session.add_connection(&cli, &srv).unwrap();
+        s.engine.sync(&s.session);
+
+        let cfg = json!({ "source": "#{ echoed: params[0] }" }).to_string();
+        s.try_set_behavior(&srv, "send", "script", &cfg).unwrap();
+        let id = s.engine.call(&conn, "send", &json!(["scripted!"])).unwrap();
+        s.engine.run();
+
+        let out: Value = serde_json::from_str(&s.result(id as f64).unwrap()).unwrap();
+        assert_eq!(out["value"], json!({ "echoed": "scripted!" }));
+    }
+
     #[test]
     fn link_round_trips_through_the_constructor() {
         let mut s = sim();

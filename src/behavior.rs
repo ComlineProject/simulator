@@ -166,6 +166,108 @@ impl Behavior for Forward {
     }
 }
 
+/// "Run a script (Rhai)" — a user-written handler. `params` (the decoded
+/// request) and a persistent `state` map are in scope; the last expression is
+/// the reply, `throw` raises an error.
+#[cfg(feature = "script")]
+mod script {
+    use super::{ok_or_none, Behavior, BehaviorCtx, BehaviorStep, SimOutcome};
+    use serde_json::Value;
+
+    thread_local! {
+        static ENGINE: rhai::Engine = build_engine();
+    }
+
+    /// A sandboxed engine: Rhai has no I/O to begin with, so this is about
+    /// bounding work and memory. `print` / `debug` are silenced.
+    fn build_engine() -> rhai::Engine {
+        let mut engine = rhai::Engine::new();
+        engine.set_max_operations(200_000);
+        engine.set_max_call_levels(48);
+        engine.set_max_expr_depths(64, 32);
+        engine.set_max_string_size(16 * 1024);
+        engine.set_max_array_size(8 * 1024);
+        engine.set_max_map_size(8 * 1024);
+        engine.on_print(|_| {});
+        engine.on_debug(|_, _, _| {});
+        engine
+    }
+
+    pub struct Script {
+        ast: Option<rhai::AST>,
+        error: Option<String>,
+        state: rhai::Dynamic,
+    }
+
+    pub fn make(source: &str) -> Box<dyn Behavior> {
+        let (ast, error) = ENGINE.with(|engine| match engine.compile(source) {
+            Ok(ast) => (Some(ast), None),
+            Err(err) => (None, Some(format!("script did not compile: {err}"))),
+        });
+        Box::new(Script {
+            ast,
+            error,
+            state: rhai::Map::new().into(),
+        })
+    }
+
+    impl Behavior for Script {
+        fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep {
+            let Some(ast) = &self.ast else {
+                return err(self.error.clone().unwrap_or_default());
+            };
+            ENGINE.with(|engine| {
+                let mut scope = rhai::Scope::new();
+                let params = rhai::serde::to_dynamic(&ctx.params).unwrap_or(rhai::Dynamic::UNIT);
+                scope.push_dynamic("params", params);
+                scope.push_dynamic("state", self.state.clone());
+
+                let outcome = engine.eval_ast_with_scope::<rhai::Dynamic>(&mut scope, ast);
+                if let Some(next) = scope.get_value::<rhai::Dynamic>("state") {
+                    self.state = next;
+                }
+                match outcome {
+                    Ok(value) => {
+                        let value =
+                            rhai::serde::from_dynamic::<Value>(&value).unwrap_or(Value::Null);
+                        BehaviorStep::Now(ok_or_none(ctx.function, value))
+                    }
+                    Err(e) => err(e.to_string()),
+                }
+            })
+        }
+    }
+
+    fn err(message: String) -> BehaviorStep {
+        BehaviorStep::Now(SimOutcome::Err {
+            ordinal: 0,
+            data: serde_json::json!({ "error": message }),
+        })
+    }
+}
+
+/// Without the `script` feature, the scripted behaviour is a stub that reports
+/// it isn't available.
+#[cfg(not(feature = "script"))]
+mod script {
+    use super::{Behavior, BehaviorCtx, BehaviorStep, SimOutcome};
+
+    struct Disabled;
+
+    pub fn make(_source: &str) -> Box<dyn Behavior> {
+        Box::new(Disabled)
+    }
+
+    impl Behavior for Disabled {
+        fn run(&mut self, _ctx: BehaviorCtx<'_>) -> BehaviorStep {
+            BehaviorStep::Now(SimOutcome::Err {
+                ordinal: 0,
+                data: serde_json::json!({ "error": "scripting is not enabled in this build" }),
+            })
+        }
+    }
+}
+
 // ── the catalogue ───────────────────────────────────────────────────────
 
 /// The canned server behaviours a simulated instance can run for one function.
@@ -179,10 +281,13 @@ pub enum BehaviorKind {
     Raise,
     Drop,
     Forward,
+    /// A user-written Rhai script (milestone 2f). Sandboxed: no I/O, capped
+    /// operations / string / collection sizes.
+    Script,
 }
 
 impl BehaviorKind {
-    pub const ALL: [BehaviorKind; 7] = [
+    pub const ALL: [BehaviorKind; 8] = [
         BehaviorKind::Reply,
         BehaviorKind::Echo,
         BehaviorKind::Increment,
@@ -190,6 +295,7 @@ impl BehaviorKind {
         BehaviorKind::Raise,
         BehaviorKind::Drop,
         BehaviorKind::Forward,
+        BehaviorKind::Script,
     ];
 
     pub fn label(self) -> &'static str {
@@ -201,6 +307,7 @@ impl BehaviorKind {
             BehaviorKind::Raise => "Raise error",
             BehaviorKind::Drop => "Drop (never reply)",
             BehaviorKind::Forward => "Forward to another server",
+            BehaviorKind::Script => "Run a script (Rhai)",
         }
     }
 
@@ -214,6 +321,7 @@ impl BehaviorKind {
             BehaviorKind::Raise => "raise",
             BehaviorKind::Drop => "drop",
             BehaviorKind::Forward => "forward",
+            BehaviorKind::Script => "script",
         }
     }
 
@@ -225,9 +333,11 @@ impl BehaviorKind {
     /// Whether this behaviour makes sense for `function`.
     pub fn applies_to(self, function: &FnShape) -> bool {
         match self {
-            BehaviorKind::Reply | BehaviorKind::Echo | BehaviorKind::Delay | BehaviorKind::Drop => {
-                true
-            }
+            BehaviorKind::Reply
+            | BehaviorKind::Echo
+            | BehaviorKind::Delay
+            | BehaviorKind::Drop
+            | BehaviorKind::Script => true,
             BehaviorKind::Increment => {
                 !function.oneway && matches!(function.returns, Some(TypeRef::Ref { .. }))
             }
@@ -273,6 +383,7 @@ impl BehaviorKind {
             BehaviorKind::Forward => {
                 serde_json::json!({ "viaConnectionId": "", "targetFn": function.name })
             }
+            BehaviorKind::Script => serde_json::json!({ "source": DEFAULT_SCRIPT }),
         }
     }
 
@@ -316,9 +427,16 @@ impl BehaviorKind {
                     .unwrap_or(&function.name)
                     .to_string(),
             }),
+            BehaviorKind::Script => script::make(get("source").as_str().unwrap_or(DEFAULT_SCRIPT)),
         }
     }
 }
+
+/// The script a fresh `Script` behaviour starts with — an echo.
+pub const DEFAULT_SCRIPT: &str = "\
+// `params` is the decoded request. `state` is a map that persists between
+// calls. The last expression is the reply; `throw` raises an error.
+params";
 
 /// The behaviour a freshly-added server function starts on.
 pub fn default_kind_for(function: &FnShape) -> BehaviorKind {
@@ -637,10 +755,126 @@ mod tests {
         for k in BehaviorKind::ALL {
             let s = serde_json::to_string(&k).unwrap();
             assert_eq!(serde_json::from_str::<BehaviorKind>(&s).unwrap(), k);
+            assert_eq!(BehaviorKind::parse(k.as_str()), Some(k));
         }
         assert_eq!(
-            serde_json::to_string(&BehaviorKind::Forward).unwrap(),
-            "\"forward\""
+            serde_json::to_string(&BehaviorKind::Script).unwrap(),
+            "\"script\""
         );
+        assert_eq!(BehaviorKind::ALL.len(), 8);
+    }
+
+    #[test]
+    fn script_default_config_is_a_source_string() {
+        let (schema, proto) = schema_with(vec![fn_send()], vec![counter_type()], vec![]);
+        let cfg = BehaviorKind::Script.default_config(&proto.functions[0], &schema);
+        assert!(cfg["source"].as_str().unwrap().contains("params"));
+        assert!(BehaviorKind::Script.applies_to(&fn_send()));
+    }
+
+    #[cfg(feature = "script")]
+    mod scripted {
+        use super::super::*;
+        use super::{ctx, fn_send, schema_with};
+        use serde_json::json;
+
+        fn run_script(source: &str, params: Value) -> BehaviorStep {
+            let (schema, proto) = schema_with(vec![fn_send()], vec![], vec![]);
+            let mut b = BehaviorKind::Script.make(
+                &json!({ "source": source }),
+                &proto.functions[0],
+                &schema,
+            );
+            b.run(ctx(&proto, params))
+        }
+
+        #[test]
+        fn a_script_returning_params_echoes() {
+            assert_eq!(
+                run_script("params", json!([1, 2, 3])),
+                BehaviorStep::Now(SimOutcome::Ok(json!([1, 2, 3])))
+            );
+        }
+
+        #[test]
+        fn a_script_can_compute_a_reply() {
+            assert_eq!(
+                run_script("#{ doubled: params[0] * 2 }", json!([21])),
+                BehaviorStep::Now(SimOutcome::Ok(json!({ "doubled": 42 })))
+            );
+        }
+
+        #[test]
+        fn state_persists_between_calls() {
+            let (schema, proto) = schema_with(vec![fn_send()], vec![], vec![]);
+            let mut b = BehaviorKind::Script.make(
+                &json!({ "source": "state.n = (state.n ?? 0) + 1; state.n" }),
+                &proto.functions[0],
+                &schema,
+            );
+            assert_eq!(
+                b.run(ctx(&proto, Value::Null)),
+                BehaviorStep::Now(SimOutcome::Ok(json!(1)))
+            );
+            assert_eq!(
+                b.run(ctx(&proto, Value::Null)),
+                BehaviorStep::Now(SimOutcome::Ok(json!(2)))
+            );
+            assert_eq!(
+                b.run(ctx(&proto, Value::Null)),
+                BehaviorStep::Now(SimOutcome::Ok(json!(3)))
+            );
+        }
+
+        #[test]
+        fn a_thrown_value_becomes_an_error() {
+            match run_script(r#"throw "boom""#, Value::Null) {
+                BehaviorStep::Now(SimOutcome::Err { ordinal: 0, data }) => {
+                    assert!(data["error"].as_str().unwrap().contains("boom"), "{data}");
+                }
+                other => panic!("expected an error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_script_that_does_not_compile_errors_at_run() {
+            match run_script("this is ( not rhai", Value::Null) {
+                BehaviorStep::Now(SimOutcome::Err { data, .. }) => {
+                    assert!(
+                        data["error"].as_str().unwrap().contains("compile"),
+                        "{data}"
+                    );
+                }
+                other => panic!("expected a compile error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn an_infinite_loop_is_stopped_not_hung() {
+            match run_script("let i = 0; while true { i += 1; } i", Value::Null) {
+                BehaviorStep::Now(SimOutcome::Err { data, .. }) => {
+                    let msg = data["error"].as_str().unwrap().to_lowercase();
+                    assert!(msg.contains("operation") || msg.contains("limit"), "{data}");
+                }
+                other => panic!("expected a limit error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_one_way_function_still_sends_nothing() {
+            let mut f = fn_send();
+            f.oneway = true;
+            f.returns = None;
+            let (schema, proto) = schema_with(vec![f], vec![], vec![]);
+            let mut b = BehaviorKind::Script.make(
+                &json!({ "source": "params" }),
+                &proto.functions[0],
+                &schema,
+            );
+            assert_eq!(
+                b.run(ctx(&proto, json!(["x"]))),
+                BehaviorStep::Now(SimOutcome::None)
+            );
+        }
     }
 }
