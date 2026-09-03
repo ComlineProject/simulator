@@ -11,6 +11,7 @@
   "files": ["pkg", "pkg-script"],
   "sideEffects": ["./pkg/comline_simulator.js", "./pkg-script/comline_simulator.js"],
   "scripts": {
-    "prepare": "bash scripts/prepare.sh"
+    "prepare": "bash scripts/prepare.sh",
+    "prepack": "bash scripts/prepare.sh"
   }
 }

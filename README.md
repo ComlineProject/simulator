@@ -72,9 +72,10 @@ install:
 "comline-simulator": "github:ComlineProject/simulator#<sha>"
 ```
 
-`npm install` clones the repo at that SHA and runs `prepare` (→ `scripts/
-prepare.sh`, which provisions the wasm target + `wasm-bindgen-cli` and calls
-`build-wasm.sh`). It leaves two builds:
+The install clones the repo at that SHA and runs the build hook — `scripts/
+prepare.sh` (via `prepare` for npm/pnpm, `prepack` for Yarn), which provisions
+the wasm target + `wasm-bindgen-cli` and calls `build-wasm.sh`. It leaves two
+builds:
 
 - `pkg/` — lean. `import init, { Sim } from "comline-simulator"`
 - `pkg-script/` — Rhai scripting. `import … from "comline-simulator/pkg-script/comline_simulator.js"`
