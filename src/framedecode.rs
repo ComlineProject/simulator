@@ -1,15 +1,14 @@
-//! Read a raw tap [`Frame`] back into something the inspector can show — the
-//! same framing / handshake decoders the runtime uses, plus a JSON decode of the
-//! sub-frame body (Phase 1 is JSON-only). Ported from `framedecode.ts`.
+//! Read a raw tap [`Frame`] back into something the inspector can show — the same
+//! framing / handshake decoders the engine uses, plus a decode of the sub-frame
+//! body with the connection's wire format. Ported from `framedecode.ts`.
 
-use comline_runtime::contract::{
-    name_hash, DatagramFraming, Envelope, Framing, Handshake, RequestCall, FRAMING_DATAGRAM,
-};
+use comline_runtime::contract::{name_hash, Envelope, Handshake, RequestCall, WireFormat};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::format::Codec;
 use crate::frame::Frame;
-use crate::shape::Framing as WireFraming;
+use crate::framing::WireFraming;
 
 /// Everything the inspector renders for one frame.
 #[derive(Debug, Serialize)]
@@ -58,6 +57,7 @@ pub struct DecodeCtx<'a> {
     pub client_name: &'a str,
     pub server_name: &'a str,
     pub framing: WireFraming,
+    pub codec: Codec,
     /// Function names in protocol order — resolves a datagram request's call id.
     pub fn_names: &'a [&'a str],
 }
@@ -79,7 +79,12 @@ impl FrameDetail {
 
 /// FNV-1a hash → readable name, for the handshake's wire-format / framing.
 fn name_of(hash: u64) -> String {
-    for name in ["json", "msgpack", FRAMING_DATAGRAM, "jsonrpc-2.0"] {
+    for name in [
+        "json",
+        "msgpack",
+        WireFraming::Datagram.name(),
+        WireFraming::Jsonrpc.name(),
+    ] {
         if name_hash(name) == hash {
             return name.to_string();
         }
@@ -87,22 +92,24 @@ fn name_of(hash: u64) -> String {
     format!("{hash:#x}")
 }
 
-fn framing_name(framing: WireFraming) -> String {
-    match framing {
-        WireFraming::Datagram => FRAMING_DATAGRAM.to_string(),
-        WireFraming::Jsonrpc => "jsonrpc-2.0".to_string(),
-    }
-}
-
-/// `(value, decoded_ok)`. An empty slice is `null`; a slice that will not parse
-/// is a `"<N undecodable bytes>"` placeholder with `decoded_ok = false`.
-fn json_of(bytes: &[u8]) -> (Value, bool) {
+/// `(value, decoded_ok)`. An empty slice is `null`; a slice the codec will not
+/// decode is a `"<N undecodable bytes>"` placeholder with `decoded_ok = false`.
+///
+/// A JSON-RPC frame carries its params / body as raw JSON regardless of the
+/// wire format, so those are always JSON-decoded; a datagram frame's body is
+/// whatever the connection's codec produced.
+fn body_of(bytes: &[u8], codec: Codec, always_json: bool) -> (Value, bool) {
     if bytes.is_empty() {
         return (Value::Null, true);
     }
-    match serde_json::from_slice::<Value>(bytes) {
-        Ok(v) => (v, true),
-        Err(_) => (
+    let decoded = if always_json {
+        serde_json::from_slice::<Value>(bytes).ok()
+    } else {
+        codec.decode::<Value>(bytes).ok()
+    };
+    match decoded {
+        Some(v) => (v, true),
+        None => (
             Value::String(format!("<{} undecodable bytes>", bytes.len())),
             false,
         ),
@@ -116,7 +123,7 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
     // Handshake — unambiguous: fixed length + `CO` magic.
     if bytes.len() == 31 {
         if let Some(hs) = Handshake::decode(bytes) {
-            let mut d = FrameDetail::bare("handshake", framing_name(ctx.framing));
+            let mut d = FrameDetail::bare("handshake", ctx.framing.name().to_string());
             d.handshake = Some(HandshakeDetail {
                 ir_hash: format!("{:#018x}", hs.ir_hash),
                 wire_format: name_of(hs.wire_format),
@@ -127,9 +134,9 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
         }
     }
 
-    // Datagram only for now — JSON-RPC arrives with the framing matrix (2g).
-    let framing = DatagramFraming;
-    let name = framing_name(ctx.framing);
+    let framing = ctx.framing;
+    let name = framing.name().to_string();
+    let jsonrpc = framing.is_named();
 
     if frame.from == ctx.client_name {
         let Some(req) = framing.decode_request(bytes) else {
@@ -143,7 +150,7 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
                 .unwrap_or_else(|| format!("#{id}")),
             RequestCall::Name(n) => n.to_string(),
         };
-        let (params, ok) = json_of(req.params);
+        let (params, ok) = body_of(req.params, ctx.codec, jsonrpc);
         let mut d = FrameDetail::bare("request", if ok { name } else { "undecodable".into() });
         d.function = Some(function);
         d.request_id = Some(req.request_id.to_string());
@@ -158,14 +165,14 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
     d.request_id = Some(request_id.to_string());
     match envelope {
         Envelope::Ok(payload) => {
-            let (value, ok) = json_of(payload);
+            let (value, ok) = body_of(payload, ctx.codec, jsonrpc);
             d.ok = Some(value);
             if !ok {
                 d.framing = "undecodable".into();
             }
         }
         Envelope::Err { id, body } => {
-            let (value, ok) = json_of(body);
+            let (value, ok) = body_of(body, ctx.codec, jsonrpc);
             d.err = Some(ErrDetail {
                 ordinal: id,
                 body: value,
@@ -208,7 +215,8 @@ mod tests {
             &DecodeCtx {
                 client_name: info.client_name,
                 server_name: info.server_name,
-                framing: WireFraming::Datagram,
+                framing: info.framing,
+                codec: info.codec,
                 fn_names: &info.fn_names,
             },
         )
@@ -225,7 +233,7 @@ mod tests {
         assert_eq!(hs.kind, "handshake");
         let h = hs.handshake.unwrap();
         assert_eq!(h.wire_format, "json");
-        assert_eq!(h.framing, FRAMING_DATAGRAM);
+        assert_eq!(h.framing, WireFraming::Datagram.name());
         assert_eq!(h.ir_hash, "0x9f2b1c7d4e6a8035");
 
         let req = detail(&e, chat::CONN, 3);

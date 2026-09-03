@@ -15,20 +15,19 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use comline_runtime::contract::{
-    Call, DatagramFraming, Envelope, Framing, Handshake, RuntimeError, WireFormat, FRAMING_DATAGRAM,
-};
+use comline_runtime::contract::{Envelope, Handshake, RuntimeError, WireFormat};
 use serde_json::{json, Value};
 
 use crate::behavior::{BehaviorKind, BehaviorStep, SimOutcome};
 use crate::clock::Clock;
 use crate::faults::{Direction, FaultSpec};
-use crate::format::Json;
+use crate::format::Codec;
 use crate::frame::Tap;
+use crate::framing::WireFraming;
 use crate::generic::{BehaviorMap, GenericDispatch};
-use crate::model::{Connection, Instance, Session};
+use crate::model::{Connection, FramingChoice, Instance, Session};
 use crate::rng::Mulberry32;
-use crate::shape::{find_protocol, ProtocolShape, SchemaShape};
+use crate::shape::{find_protocol, Framing as ShapeFraming, ProtocolShape, SchemaShape};
 use crate::wire::{Channel, SendOutcome, REORDER_FLUSH_MS};
 
 /// What a settled call produced.
@@ -89,7 +88,8 @@ struct Wire {
     server_id: String,
     client_name: String,
     server_name: String,
-    framing: DatagramFraming,
+    framing: WireFraming,
+    codec: Codec,
     /// `None` when connected; otherwise why it was refused (`"handshake"` for a
     /// version / framing / wire-format mismatch).
     error: Option<String>,
@@ -115,6 +115,8 @@ pub struct WireInfo<'a> {
     pub client_name: &'a str,
     pub server_name: &'a str,
     pub fn_names: Vec<&'a str>,
+    pub framing: WireFraming,
+    pub codec: Codec,
     pub error: Option<&'a str>,
     pub dead: bool,
 }
@@ -200,18 +202,37 @@ impl Engine {
 
         let behaviors = build_behaviors(server, proto, schema);
 
+        // Framing: the connection's choice, else the protocol's. Codec: the
+        // connection's. JSON-RPC is a JSON text envelope — it can't carry a
+        // MessagePack body, so that pair is refused.
+        let framing = match conn.framing {
+            FramingChoice::Auto => match proto.framing {
+                ShapeFraming::Jsonrpc => WireFraming::Jsonrpc,
+                ShapeFraming::Datagram => WireFraming::Datagram,
+            },
+            FramingChoice::Datagram => WireFraming::Datagram,
+            FramingChoice::Jsonrpc => WireFraming::Jsonrpc,
+        };
+        let codec = conn.wire_format;
+        let bad_combo = framing == WireFraming::Jsonrpc && codec == Codec::Msgpack;
+
         // Handshake: record a frame each way (the inspector shows them) and
-        // refuse on a mismatch. Both ends always speak JSON + the protocol's
-        // framing, so only the IR hash can disagree — that is the version-skew
-        // demo. A partition cuts the handshake too → also a refusal.
+        // refuse on a mismatch. The two ends always agree on codec + framing, so
+        // only the IR hash can disagree — the version-skew demo. A partition
+        // cuts the handshake too → also a refusal.
         let error = {
-            let c_hs = handshake_frame(&client.ir_hash);
-            let s_hs = handshake_frame(&server.ir_hash);
+            let c_hs = handshake_frame(&client.ir_hash, codec.name(), framing.name());
+            let s_hs = handshake_frame(&server.ir_hash, codec.name(), framing.name());
             let c = channel.send(Direction::Request, &c_hs, 0.0, &mut self.rng);
             let s = channel.send(Direction::Response, &s_hs, 0.0, &mut self.rng);
             let cut = matches!(c, SendOutcome::Dropped) || matches!(s, SendOutcome::Dropped);
-            // partition swallowed the handshake, or the two ends' IR disagrees
-            (cut || client.ir_hash != server.ir_hash).then(|| "handshake".to_string())
+            if bad_combo {
+                Some("json-rpc framing requires the json codec".to_string())
+            } else if cut || client.ir_hash != server.ir_hash {
+                Some("handshake".to_string())
+            } else {
+                None
+            }
         };
 
         Wire {
@@ -222,7 +243,8 @@ impl Engine {
             server_id: server.id.clone(),
             client_name: client.name.clone(),
             server_name: server.name.clone(),
-            framing: DatagramFraming,
+            framing,
+            codec,
             error,
             timeout_ms: session.call_timeout_ms.max(0.0),
             dead: false,
@@ -315,6 +337,8 @@ impl Engine {
                 .iter()
                 .map(|f| f.name.as_str())
                 .collect(),
+            framing: w.framing,
+            codec: w.codec,
             error: w.error.as_deref(),
             dead: w.dead,
         })
@@ -344,7 +368,6 @@ impl Engine {
         fn_name: &str,
         params: &Value,
     ) -> Result<u64, RuntimeError> {
-        let fmt = Json;
         let wire = self.wires.get(conn_id).ok_or(RuntimeError::Transport)?;
         if wire.error.is_some() {
             return Err(RuntimeError::Handshake);
@@ -367,7 +390,7 @@ impl Engine {
         let id = self.next_request_id;
         let mut frame = Vec::new();
         wire.framing
-            .encode_request(Call::new(call_id, ""), id, params, &fmt, &mut frame)?;
+            .encode_request(call_id, fn_name, id, params, &wire.codec, &mut frame)?;
 
         self.emit(conn_id, Direction::Request, frame);
         if one_way {
@@ -471,7 +494,6 @@ impl Engine {
 
     /// Server side: decode the request, run its behaviour, act on the step.
     fn serve(&mut self, conn_id: &str, request_frame: &[u8]) {
-        let fmt = Json;
         let Some(wire) = self.wires.get_mut(conn_id) else {
             return;
         };
@@ -479,9 +501,10 @@ impl Engine {
             return;
         };
         let request_id = req.request_id;
+        let codec = wire.codec;
         let step = match wire
             .dispatch
-            .dispatch(req.call, req.params, &fmt, &mut wire.behaviors)
+            .dispatch(req.call, req.params, &codec, &mut wire.behaviors)
         {
             Ok(step) => step,
             Err(_) => return,
@@ -510,15 +533,15 @@ impl Engine {
 
     /// Client side: decode the response frame and settle the matching call.
     fn receive(&mut self, conn_id: &str, response_frame: &[u8]) {
-        let fmt = Json;
         let Some(wire) = self.wires.get(conn_id) else {
             return;
         };
+        let codec = wire.codec;
         let Some((request_id, envelope)) = wire.framing.decode_response(response_frame) else {
             return;
         };
         let result = match envelope {
-            Envelope::Ok(payload) => match fmt.decode::<Value>(payload) {
+            Envelope::Ok(payload) => match codec.decode::<Value>(payload) {
                 Ok(value) => CallResult::Ok(value),
                 Err(_) => CallResult::Undecodable("ok body did not decode".into()),
             },
@@ -526,7 +549,7 @@ impl Engine {
                 let body = if body.is_empty() {
                     Value::Null
                 } else {
-                    fmt.decode::<Value>(body).unwrap_or(Value::Null)
+                    codec.decode::<Value>(body).unwrap_or(Value::Null)
                 };
                 CallResult::Err { ordinal: id, body }
             }
@@ -536,27 +559,25 @@ impl Engine {
 
     /// Frame `outcome` as a response to `request_id` on `conn_id` and send it.
     fn reply_now(&mut self, conn_id: &str, request_id: u64, outcome: SimOutcome) {
-        let fmt = Json;
         let Some(wire) = self.wires.get(conn_id) else {
             return;
         };
+        let (framing, codec) = (wire.framing, wire.codec);
         let mut resp = Vec::new();
         match outcome {
             SimOutcome::Ok(value) => {
                 let mut body = Vec::new();
-                if fmt.encode(&value, &mut body).is_err() {
+                if codec.encode(&value, &mut body).is_err() {
                     return;
                 }
-                wire.framing
-                    .encode_response_ok(request_id, &body, &mut resp);
+                framing.encode_response_ok(request_id, &body, &mut resp);
             }
             SimOutcome::Err { ordinal, data } => {
                 let mut body = Vec::new();
-                if fmt.encode(&data, &mut body).is_err() {
+                if codec.encode(&data, &mut body).is_err() {
                     return;
                 }
-                wire.framing
-                    .encode_response_err(request_id, ordinal, &body, &mut resp);
+                framing.encode_response_err(request_id, ordinal, &body, &mut resp);
             }
             SimOutcome::None => return,
         }
@@ -682,15 +703,67 @@ fn build_behaviors(server: &Instance, proto: &ProtocolShape, schema: &SchemaShap
         .collect()
 }
 
-/// A 31-byte handshake frame carrying the instance's IR hash. JSON wire format,
-/// datagram framing — the axes the sim never varies.
-fn handshake_frame(ir_hash: &str) -> Vec<u8> {
+/// The framing / codec combinations the compare panel runs (2g). JSON-RPC pairs
+/// only with JSON.
+pub const TRANSPORT_MATRIX: [(FramingChoice, Codec); 3] = [
+    (FramingChoice::Datagram, Codec::Json),
+    (FramingChoice::Datagram, Codec::Msgpack),
+    (FramingChoice::Jsonrpc, Codec::Json),
+];
+
+/// One combo's run: its label, the frame log, and the settled call outcome.
+pub struct MatrixRun {
+    pub label: String,
+    pub frames: Vec<crate::frame::Frame>,
+    pub result: Option<CallResult>,
+}
+
+/// Run the same call on connection `conn_id` over each transport combo, on a
+/// throwaway engine per combo (so the session isn't disturbed). The decoded
+/// bodies should match across all of them — divergence is a framing / codec bug.
+pub fn compare_transports(
+    session: &Session,
+    conn_id: &str,
+    fn_name: &str,
+    params: &Value,
+) -> Vec<MatrixRun> {
+    TRANSPORT_MATRIX
+        .iter()
+        .map(|&(framing, codec)| {
+            let mut s = session.clone();
+            s.set_transport(conn_id, framing, codec);
+            let mut engine = Engine::new();
+            engine.rebuild(&s);
+            let id = engine.call(conn_id, fn_name, params).ok();
+            engine.run();
+            MatrixRun {
+                label: format!("{}/{}", framing_label(framing), codec.name()),
+                frames: engine
+                    .tap(conn_id)
+                    .map(|t| t.frames.clone())
+                    .unwrap_or_default(),
+                result: id.and_then(|id| engine.result(id).cloned()),
+            }
+        })
+        .collect()
+}
+
+fn framing_label(f: FramingChoice) -> &'static str {
+    match f {
+        FramingChoice::Jsonrpc => "jsonrpc",
+        _ => "datagram",
+    }
+}
+
+/// A 31-byte handshake frame carrying the instance's IR hash and the connection's
+/// wire-format / framing names (hashed in).
+fn handshake_frame(ir_hash: &str, wire_format: &str, framing: &str) -> Vec<u8> {
     let hash = ir_hash
         .strip_prefix("0x")
         .and_then(|h| u64::from_str_radix(h, 16).ok())
         .unwrap_or(0);
     let mut buf = Vec::new();
-    Handshake::new(hash, "json", FRAMING_DATAGRAM, 0).encode(&mut buf);
+    Handshake::new(hash, wire_format, framing, 0).encode(&mut buf);
     buf
 }
 
@@ -1177,5 +1250,79 @@ mod tests {
         assert_eq!(e.result(id), Some(&CallResult::Timeout));
         assert!(e.connection_dead(&c_outer), "the outer wire is dead");
         assert!(e.connection_dead(&c_gw_backend), "so is the hung upstream");
+    }
+
+    // ── framing / codec matrix (2g) ─────────────────────────────────────
+
+    #[test]
+    fn a_call_round_trips_over_every_transport_combo() {
+        for (framing, codec) in TRANSPORT_MATRIX {
+            let mut session = chat::session();
+            session.set_transport(chat::CONN, framing, codec);
+            let mut e = Engine::new();
+            e.sync(&session);
+            assert!(
+                e.connection_error(chat::CONN).is_none(),
+                "{framing:?}/{codec:?} connected"
+            );
+
+            let id = e.call(chat::CONN, "send", &json!(["hi"])).unwrap();
+            e.run();
+            assert_eq!(
+                e.result(id),
+                Some(&CallResult::Ok(hello())),
+                "{framing:?}/{codec:?} decoded body"
+            );
+        }
+    }
+
+    #[test]
+    fn json_rpc_with_msgpack_is_refused() {
+        let mut session = chat::session();
+        session.set_transport(chat::CONN, FramingChoice::Jsonrpc, Codec::Msgpack);
+        let mut e = Engine::new();
+        e.sync(&session);
+        assert_eq!(
+            e.connection_error(chat::CONN),
+            Some("json-rpc framing requires the json codec")
+        );
+    }
+
+    #[test]
+    fn compare_transports_agrees_on_the_body_and_differs_on_the_frames() {
+        let session = chat::session();
+        let runs = compare_transports(&session, chat::CONN, "send", &json!(["hi"]));
+        assert_eq!(runs.len(), 3);
+
+        // every combo decodes to the same reply
+        for run in &runs {
+            assert_eq!(
+                run.result,
+                Some(CallResult::Ok(hello())),
+                "{} body",
+                run.label
+            );
+        }
+
+        // the datagram + msgpack request frame is shorter than the datagram +
+        // json one, and the json-rpc one is a text frame
+        let req_bytes = |label: &str| {
+            runs.iter()
+                .find(|r| r.label == label)
+                .unwrap()
+                .frames
+                .iter()
+                .find(|f| f.kind == FrameKind::Request)
+                .unwrap()
+                .bytes
+                .clone()
+        };
+        let dg_json = req_bytes("datagram/json");
+        let dg_mp = req_bytes("datagram/msgpack");
+        let rpc = req_bytes("jsonrpc/json");
+        assert!(dg_mp.len() < dg_json.len(), "msgpack is tighter");
+        assert!(std::str::from_utf8(&rpc)
+            .unwrap()
+            .contains("\"method\":\"send\""));
     }
 }

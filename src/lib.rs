@@ -30,6 +30,7 @@ pub mod faults;
 pub mod format;
 pub mod frame;
 pub mod framedecode;
+pub mod framing;
 pub mod generic;
 pub mod model;
 pub mod record;
