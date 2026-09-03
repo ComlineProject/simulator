@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::behavior::{default_kind_for, BehaviorKind};
 use crate::faults::{no_faults, FaultSpec};
+use crate::format::Codec;
 use crate::shape::{find_protocol, ProjectShape};
 
 /// Which side of a protocol an instance plays.
@@ -75,6 +76,28 @@ pub struct Node {
     pub instance_ids: Vec<String>,
 }
 
+/// Which framing a connection speaks — `Auto` follows the protocol's `@framing`,
+/// the others override it (for the framing / codec compare, 2g).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FramingChoice {
+    #[default]
+    Auto,
+    Datagram,
+    Jsonrpc,
+}
+
+impl FramingChoice {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(FramingChoice::Auto),
+            "datagram" => Some(FramingChoice::Datagram),
+            "jsonrpc" => Some(FramingChoice::Jsonrpc),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Connection {
@@ -84,6 +107,13 @@ pub struct Connection {
     /// The unreliable-wire spec for this connection. Mutated in place by the
     /// inspector; the engine hands the same object to both transports.
     pub faults: FaultSpec,
+    /// The framing this connection speaks. Old links without the field decode
+    /// as `Auto`.
+    #[serde(default)]
+    pub framing: FramingChoice,
+    /// The wire format (JSON / MessagePack).
+    #[serde(default)]
+    pub wire_format: Codec,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -317,8 +347,18 @@ impl Session {
             client_id: client_id.to_string(),
             server_id: server_id.to_string(),
             faults: no_faults(),
+            framing: FramingChoice::Auto,
+            wire_format: Codec::default(),
         });
         Ok(id)
+    }
+
+    /// Set a connection's framing / wire format (the compare axes, 2g).
+    pub fn set_transport(&mut self, conn_id: &str, framing: FramingChoice, wire_format: Codec) {
+        if let Some(conn) = self.connections.iter_mut().find(|c| c.id == conn_id) {
+            conn.framing = framing;
+            conn.wire_format = wire_format;
+        }
     }
 
     pub fn remove_connection(&mut self, conn_id: &str) {

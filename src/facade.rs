@@ -11,11 +11,13 @@ use wasm_bindgen::prelude::*;
 
 use crate::behavior::BehaviorKind;
 use crate::engine::{CallResult, Engine};
+use crate::format::Codec;
 use crate::framedecode::{describe_frame, DecodeCtx};
+use crate::model::FramingChoice;
 use crate::model::{InstanceSpec, Placement, Role, Session};
 use crate::record::{Input, Recorder, Recording};
 use crate::session_codec::{decode_session, encode_session};
-use crate::shape::{find_protocol, Framing as WireFraming, ProjectShape};
+use crate::shape::{find_protocol, ProjectShape};
 
 fn js_err(message: String) -> JsValue {
     JsValue::from_str(&message)
@@ -249,6 +251,48 @@ impl Sim {
         Ok(())
     }
 
+    /// Set a connection's framing (`auto` / `datagram` / `jsonrpc`) and wire
+    /// format (`json` / `msgpack`), then re-open the wire.
+    pub fn set_transport(
+        &mut self,
+        conn_id: &str,
+        framing: &str,
+        wire_format: &str,
+    ) -> Result<(), JsValue> {
+        let framing = FramingChoice::parse(framing)
+            .ok_or_else(|| js_err(format!("unknown framing {framing}")))?;
+        let codec = Codec::parse(wire_format)
+            .ok_or_else(|| js_err(format!("unknown wire format {wire_format}")))?;
+        self.session.set_transport(conn_id, framing, codec);
+        self.engine.rebuild(&self.session);
+        Ok(())
+    }
+
+    /// Run the same call over each framing / codec combo (2g). Returns
+    /// `{ "datagram/json": { frames, result }, … }` JSON; the decoded bodies
+    /// should match across all of them.
+    pub fn compare(
+        &self,
+        conn_id: &str,
+        fn_name: &str,
+        params_json: &str,
+    ) -> Result<String, JsValue> {
+        let params: Value = serde_json::from_str(params_json)
+            .map_err(|e| js_err(format!("bad params json: {e}")))?;
+        let runs = crate::engine::compare_transports(&self.session, conn_id, fn_name, &params);
+        let mut out = serde_json::Map::new();
+        for run in runs {
+            out.insert(
+                run.label,
+                json!({
+                    "frames": run.frames,
+                    "result": run.result.as_ref().map(call_result_json),
+                }),
+            );
+        }
+        Ok(Value::Object(out).to_string())
+    }
+
     // ── driving ──────────────────────────────────────────────────────────
 
     /// Frame a call; returns the request id (read the outcome back with
@@ -341,7 +385,8 @@ impl Sim {
             &DecodeCtx {
                 client_name: info.client_name,
                 server_name: info.server_name,
-                framing: WireFraming::Datagram,
+                framing: info.framing,
+                codec: info.codec,
                 fn_names: &info.fn_names,
             },
         );
@@ -534,6 +579,62 @@ mod tests {
         assert!(
             frames.iter().any(|f| f["kind"] == "response"),
             "the replayed call produced a reply"
+        );
+    }
+
+    #[test]
+    fn compare_returns_one_entry_per_transport_combo() {
+        let mut s = Sim::try_new(&serde_json::to_string(&chat::shape()).unwrap(), None).unwrap();
+        s.session = chat::session();
+        s.engine.sync(&s.session);
+
+        let out: Value = serde_json::from_str(
+            &s.compare(chat::CONN, "send", "[\"hi\"]")
+                .map_err(|_| ())
+                .unwrap(),
+        )
+        .unwrap();
+        let obj = out.as_object().unwrap();
+        assert_eq!(obj.len(), 3);
+        assert!(obj.contains_key("datagram/json"));
+        assert!(obj.contains_key("datagram/msgpack"));
+        assert!(obj.contains_key("jsonrpc/json"));
+        for (label, run) in obj {
+            assert_eq!(run["result"]["status"], "ok", "{label}");
+            assert_eq!(
+                run["result"]["value"],
+                json!({ "body": "HELLO", "seq": 1 }),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_transport_switches_a_live_connection() {
+        let mut s = Sim::try_new(&serde_json::to_string(&chat::shape()).unwrap(), None).unwrap();
+        s.session = chat::session();
+        s.engine.sync(&s.session);
+
+        s.set_transport(chat::CONN, "jsonrpc", "json")
+            .map_err(|_| ())
+            .unwrap();
+        let id = s.engine.call(chat::CONN, "send", &json!(["hi"])).unwrap();
+        s.engine.run();
+        assert_eq!(
+            serde_json::from_str::<Value>(&s.result(id as f64).unwrap()).unwrap()["value"],
+            json!({ "body": "HELLO", "seq": 1 })
+        );
+        // the request frame is now a json-rpc text frame
+        let req: Value = serde_json::from_str(&s.describe_frame(chat::CONN, 3).unwrap()).unwrap();
+        assert_eq!(req["framing"], "jsonrpc-2.0");
+
+        // the parse succeeds but the combo is invalid → the connection is refused
+        s.set_transport(chat::CONN, "jsonrpc", "msgpack")
+            .map_err(|_| ())
+            .unwrap();
+        assert_eq!(
+            s.connection_error(chat::CONN).as_deref(),
+            Some("json-rpc framing requires the json codec")
         );
     }
 }
