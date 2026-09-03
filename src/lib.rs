@@ -16,6 +16,7 @@
 //! - [`behavior`] — what a server instance does for one function
 //! - [`generic`] — a dispatcher driven by a [`shape::ProtocolShape`], no codegen
 //! - [`pump`] — the discrete-event pump that ties a call to its reply
+//! - [`model`] — the session: nodes, instances, connections and their operations
 
 pub mod behavior;
 pub mod clock;
@@ -23,6 +24,7 @@ pub mod faults;
 pub mod format;
 pub mod frame;
 pub mod generic;
+pub mod model;
 pub mod pump;
 pub mod rng;
 pub mod shape;
