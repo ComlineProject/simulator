@@ -1,9 +1,13 @@
 //! `comline-simulator` — the simulation engine behind the Comline playground
 //! and tutorial. Wires two protocol instances over the *real* `comline-runtime`
 //! contract, in-memory, pumped on a single thread so a virtual clock can pause
-//! it. This module is the spike: prove a `send` round-trip works against the
-//! runtime's framing / envelope / dispatch, then build faults / clock /
-//! behaviours / record-replay on top.
+//! it. The `smoke_send` spike proves a `send` round-trip works against the
+//! runtime's framing / envelope / dispatch; the engine (faults / clock /
+//! behaviours / record-replay) is being ported on top of it module by module.
+
+pub mod faults;
+pub mod frame;
+pub mod rng;
 
 use std::collections::VecDeque;
 
@@ -115,7 +119,9 @@ pub fn smoke_send(text: &str, reply_body: &str) -> Result<Vec<String>, String> {
 
     // server pump: decode the request, dispatch, frame the response
     let inbound = chan.a2b.pop_front().ok_or("no request queued")?;
-    let request = framing.decode_request(&inbound).ok_or("bad request frame")?;
+    let request = framing
+        .decode_request(&inbound)
+        .ok_or("bad request frame")?;
     let mut body = Vec::new();
     let outcome = {
         let mut reply = Reply::new(&mut body);
@@ -146,7 +152,9 @@ pub fn smoke_send(text: &str, reply_body: &str) -> Result<Vec<String>, String> {
         return Err(format!("request-id mismatch: {echoed}"));
     }
     let value: Message = match envelope {
-        Envelope::Ok(payload) => fmt.decode(payload).map_err(|e| format!("decode ok: {e:?}"))?,
+        Envelope::Ok(payload) => fmt
+            .decode(payload)
+            .map_err(|e| format!("decode ok: {e:?}"))?,
         Envelope::Err { id, .. } => return Err(format!("remote error, ordinal {id}")),
     };
     if value.body != reply_body {
