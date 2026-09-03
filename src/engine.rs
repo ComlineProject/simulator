@@ -87,6 +87,8 @@ struct Wire {
     behaviors: BehaviorMap,
     client_id: String,
     server_id: String,
+    client_name: String,
+    server_name: String,
     framing: DatagramFraming,
     /// `None` when connected; otherwise why it was refused (`"handshake"` for a
     /// version / framing / wire-format mismatch).
@@ -104,6 +106,17 @@ struct ForwardCont {
     outer_conn: String,
     outer_request_id: u64,
     via: String,
+}
+
+/// A read-only view of one live connection.
+pub struct WireInfo<'a> {
+    pub client_id: &'a str,
+    pub server_id: &'a str,
+    pub client_name: &'a str,
+    pub server_name: &'a str,
+    pub fn_names: Vec<&'a str>,
+    pub error: Option<&'a str>,
+    pub dead: bool,
 }
 
 pub struct Engine {
@@ -207,6 +220,8 @@ impl Engine {
             behaviors,
             client_id: client.id.clone(),
             server_id: server.id.clone(),
+            client_name: client.name.clone(),
+            server_name: server.name.clone(),
             framing: DatagramFraming,
             error,
             timeout_ms: session.call_timeout_ms.max(0.0),
@@ -282,6 +297,27 @@ impl Engine {
     /// must be reopened ([`Engine::rebuild`]).
     pub fn connection_dead(&self, conn_id: &str) -> bool {
         self.wires.get(conn_id).is_some_and(|w| w.dead)
+    }
+
+    /// The endpoint names, function names and status of a live connection — what
+    /// the frame inspector needs to decode its frames.
+    pub fn wire_info(&self, conn_id: &str) -> Option<WireInfo<'_>> {
+        let w = self.wires.get(conn_id)?;
+        Some(WireInfo {
+            client_id: &w.client_id,
+            server_id: &w.server_id,
+            client_name: &w.client_name,
+            server_name: &w.server_name,
+            fn_names: w
+                .dispatch
+                .protocol()
+                .functions
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect(),
+            error: w.error.as_deref(),
+            dead: w.dead,
+        })
     }
 
     pub fn connection_ids(&self) -> impl Iterator<Item = &str> {

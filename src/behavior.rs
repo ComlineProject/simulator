@@ -204,6 +204,24 @@ impl BehaviorKind {
         }
     }
 
+    /// The lowercase tag it serializes as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BehaviorKind::Reply => "reply",
+            BehaviorKind::Echo => "echo",
+            BehaviorKind::Increment => "increment",
+            BehaviorKind::Delay => "delay",
+            BehaviorKind::Raise => "raise",
+            BehaviorKind::Drop => "drop",
+            BehaviorKind::Forward => "forward",
+        }
+    }
+
+    /// Parse the lowercase tag.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+
     /// Whether this behaviour makes sense for `function`.
     pub fn applies_to(self, function: &FnShape) -> bool {
         match self {
