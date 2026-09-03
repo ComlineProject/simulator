@@ -1,0 +1,26 @@
+[package]
+name = "comline-simulator"
+version = "0.0.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+description = "The Comline playground / tutorial simulation engine — Rust → WASM."
+repository = "https://github.com/ComlineProject/simulator"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The real runtime contract — framing, envelope, handshake, dispatch, wire
+# format. `alloc` only: `std` pulls `libloading` (dylib) which won't build for
+# wasm32. The simulator supplies its own `WireFormat` (JSON), tapped transport
+# and pump on top of these.
+comline-runtime = { git = "https://github.com/ComlineProject/runtime", rev = "0dda42de5105e75e339bf66fa38085bd53ab9ab9", default-features = false, features = ["alloc"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
