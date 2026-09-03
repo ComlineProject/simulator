@@ -397,6 +397,38 @@ impl Sim {
         self.engine.connection_error(conn_id).map(str::to_string)
     }
 
+    /// The behaviour picker's options for `schema_ns::protocol::fn_name`, as
+    /// `[{ "kind", "label", "applies" }]` JSON — `applies` is whether the kind
+    /// makes sense for that function. `[]` if the function is unknown.
+    pub fn behavior_catalog(&self, schema_ns: &str, protocol: &str, fn_name: &str) -> String {
+        let Some((_, proto)) = find_protocol(&self.session.shape, schema_ns, protocol) else {
+            return "[]".into();
+        };
+        let Some(function) = proto.functions.iter().find(|f| f.name == fn_name) else {
+            return "[]".into();
+        };
+        let catalog: Vec<Value> = BehaviorKind::ALL
+            .iter()
+            .map(|k| {
+                json!({
+                    "kind": k.as_str(),
+                    "label": k.label(),
+                    "applies": k.applies_to(function),
+                })
+            })
+            .collect();
+        Value::Array(catalog).to_string()
+    }
+
+    /// The behaviour a freshly-added server function starts on, for
+    /// `schema_ns::protocol::fn_name` — `"reply"` or `"drop"`.
+    pub fn default_behavior_kind(&self, schema_ns: &str, protocol: &str, fn_name: &str) -> String {
+        find_protocol(&self.session.shape, schema_ns, protocol)
+            .and_then(|(_, p)| p.functions.iter().find(|f| f.name == fn_name))
+            .map(|f| crate::behavior::default_kind_for(f).as_str().to_string())
+            .unwrap_or_else(|| "reply".into())
+    }
+
     pub fn connection_dead(&self, conn_id: &str) -> bool {
         self.engine.connection_dead(conn_id)
     }
@@ -636,5 +668,27 @@ mod tests {
             s.connection_error(chat::CONN).as_deref(),
             Some("json-rpc framing requires the json codec")
         );
+    }
+
+    #[test]
+    fn behavior_catalog_lists_kinds_and_gates_them() {
+        let s = Sim::try_new(&serde_json::to_string(&chat::shape()).unwrap(), None).unwrap();
+
+        let catalog: Vec<Value> =
+            serde_json::from_str(&s.behavior_catalog("chat", "Chat", "send")).unwrap();
+        assert_eq!(catalog.len(), 8);
+
+        let by_kind = |k: &str| {
+            catalog.iter().find(|e| e["kind"] == k).unwrap()["applies"]
+                .as_bool()
+                .unwrap()
+        };
+        assert!(by_kind("reply"));
+        assert!(by_kind("increment")); // send returns a struct ref
+        assert!(!by_kind("raise")); // send has no throws
+        assert!(by_kind("script"));
+
+        assert_eq!(s.behavior_catalog("chat", "Chat", "nope"), "[]");
+        assert_eq!(s.default_behavior_kind("chat", "Chat", "send"), "reply");
     }
 }
