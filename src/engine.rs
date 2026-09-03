@@ -1,0 +1,967 @@
+//! The engine: many connections over one shared discrete-event [`Clock`], each a
+//! tapped [`Channel`] + a [`GenericDispatch`] + its behaviour map. Ported from
+//! `engine.ts`'s `Wires` / `connect`, minus the `async` `Client` / `Server` — a
+//! call schedules a request-delivery event and settles later via [`Engine::result`].
+//!
+//! Cross-connection `forward` relays through a continuation map keyed by the
+//! inner call's request id, with a `forwarding` set as the cycle guard — the
+//! same shape as `Wires.forwardVia`, without parking a stack frame.
+//!
+//! Not yet ported: the client call timeout / `dead` desync (2c) and
+//! `replay_recording` — both land in the next slice.
+//!
+//! [`Clock`]: crate::clock::Clock
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+use comline_runtime::contract::{
+    Call, DatagramFraming, Envelope, Framing, Handshake, RuntimeError, WireFormat, FRAMING_DATAGRAM,
+};
+use serde_json::{json, Value};
+
+use crate::behavior::{BehaviorKind, BehaviorStep, SimOutcome};
+use crate::clock::Clock;
+use crate::faults::{Direction, FaultSpec};
+use crate::format::Json;
+use crate::frame::Tap;
+use crate::generic::{BehaviorMap, GenericDispatch};
+use crate::model::{Connection, Instance, Session};
+use crate::rng::Mulberry32;
+use crate::shape::{find_protocol, ProtocolShape, SchemaShape};
+use crate::wire::{Channel, SendOutcome, REORDER_FLUSH_MS};
+
+/// What a settled call produced.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallResult {
+    /// A decoded success value.
+    Ok(Value),
+    /// A raised schema error: its schema-global `ordinal` and decoded `body`.
+    Err { ordinal: u16, body: Value },
+    /// The response frame arrived but its body would not decode — e.g. a
+    /// corrupted wire. The call never gets a clean value.
+    Undecodable(String),
+}
+
+/// A scheduled step of the simulation, tagged with the connection it belongs to.
+enum Event {
+    DeliverToServer {
+        conn: String,
+        frame: Vec<u8>,
+    },
+    DeliverToClient {
+        conn: String,
+        frame: Vec<u8>,
+    },
+    FlushReorder {
+        conn: String,
+        dir: Direction,
+    },
+    CompleteReply {
+        conn: String,
+        request_id: u64,
+        outcome: SimOutcome,
+    },
+}
+
+fn deliver_event(conn: String, dir: Direction, frame: Vec<u8>) -> Event {
+    match dir {
+        Direction::Request => Event::DeliverToServer { conn, frame },
+        Direction::Response => Event::DeliverToClient { conn, frame },
+    }
+}
+
+/// One live connection.
+struct Wire {
+    channel: Channel,
+    dispatch: GenericDispatch,
+    behaviors: BehaviorMap,
+    client_id: String,
+    server_id: String,
+    framing: DatagramFraming,
+    /// `None` when connected; otherwise why it was refused (`"handshake"` for a
+    /// version / framing / wire-format mismatch).
+    error: Option<String>,
+}
+
+/// A forwarded call in flight: when the inner call settles, answer the outer one.
+struct ForwardCont {
+    outer_conn: String,
+    outer_request_id: u64,
+    via: String,
+}
+
+pub struct Engine {
+    clock: Clock<Event>,
+    rng: Mulberry32,
+    wires: BTreeMap<String, Wire>,
+    next_request_id: u64,
+    results: HashMap<u64, CallResult>,
+    forwards: HashMap<u64, ForwardCont>,
+    forwarding: HashSet<String>,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Engine {
+    pub fn new() -> Self {
+        Self {
+            clock: Clock::new(),
+            rng: Mulberry32::new(1),
+            wires: BTreeMap::new(),
+            next_request_id: 0,
+            results: HashMap::new(),
+            forwards: HashMap::new(),
+            forwarding: HashSet::new(),
+        }
+    }
+
+    // ── session wiring ───────────────────────────────────────────────────
+
+    /// Match the live wire set to `session.connections`: open the ones that
+    /// appeared, close the ones that vanished, leave the rest running.
+    pub fn sync(&mut self, session: &Session) {
+        let want: HashSet<&str> = session.connections.iter().map(|c| c.id.as_str()).collect();
+        self.wires.retain(|id, _| want.contains(id.as_str()));
+        for conn in &session.connections {
+            if self.wires.contains_key(&conn.id) {
+                continue;
+            }
+            let wire = self.connect(session, conn);
+            self.wires.insert(conn.id.clone(), wire);
+        }
+    }
+
+    /// Close every wire and re-open from scratch, re-seeding the fault RNG so a
+    /// stepped run from `session.seed` is reproducible. The clock keeps running
+    /// (time doesn't jump back on a schema / latency edit).
+    pub fn rebuild(&mut self, session: &Session) {
+        self.wires.clear();
+        self.forwards.clear();
+        self.forwarding.clear();
+        self.rng = Mulberry32::new(session.seed);
+        self.sync(session);
+    }
+
+    fn connect(&mut self, session: &Session, conn: &Connection) -> Wire {
+        let client = session
+            .instance(&conn.client_id)
+            .expect("connect: client instance exists");
+        let server = session
+            .instance(&conn.server_id)
+            .expect("connect: server instance exists");
+        let (schema, proto) = find_protocol(&session.shape, &server.schema_ns, &server.protocol)
+            .expect("connect: the server's protocol is compiled");
+
+        let mut channel = Channel::new(client.name.clone(), server.name.clone());
+        channel.set_latency(session.latency_ms);
+        *channel.faults_mut() = conn.faults.clone();
+
+        let behaviors = build_behaviors(server, proto, schema);
+
+        // Handshake: record a frame each way (the inspector shows them) and
+        // refuse on a mismatch. Both ends always speak JSON + the protocol's
+        // framing, so only the IR hash can disagree — that is the version-skew
+        // demo. A partition cuts the handshake too → also a refusal.
+        let error = {
+            let c_hs = handshake_frame(&client.ir_hash);
+            let s_hs = handshake_frame(&server.ir_hash);
+            let c = channel.send(Direction::Request, &c_hs, 0.0, &mut self.rng);
+            let s = channel.send(Direction::Response, &s_hs, 0.0, &mut self.rng);
+            let cut = matches!(c, SendOutcome::Dropped) || matches!(s, SendOutcome::Dropped);
+            // partition swallowed the handshake, or the two ends' IR disagrees
+            (cut || client.ir_hash != server.ir_hash).then(|| "handshake".to_string())
+        };
+
+        Wire {
+            channel,
+            dispatch: GenericDispatch::new(proto.clone()),
+            behaviors,
+            client_id: client.id.clone(),
+            server_id: server.id.clone(),
+            framing: DatagramFraming,
+            error,
+        }
+    }
+
+    // ── knobs ────────────────────────────────────────────────────────────
+
+    /// Swap a live server behaviour; takes effect on the next call.
+    pub fn set_behavior(
+        &mut self,
+        conn_id: &str,
+        fn_name: &str,
+        kind: BehaviorKind,
+        config: &Value,
+        schema: &SchemaShape,
+    ) -> Result<(), String> {
+        let wire = self
+            .wires
+            .get_mut(conn_id)
+            .ok_or_else(|| format!("no connection {conn_id}"))?;
+        let function = wire
+            .dispatch
+            .protocol()
+            .functions
+            .iter()
+            .find(|f| f.name == fn_name)
+            .ok_or_else(|| format!("no function {fn_name}"))?
+            .clone();
+        wire.behaviors
+            .insert(fn_name.to_string(), kind.make(config, &function, schema));
+        Ok(())
+    }
+
+    /// Replace a live connection's fault spec (edited in the inspector, no
+    /// reconnect).
+    pub fn set_faults(&mut self, conn_id: &str, spec: FaultSpec) {
+        if let Some(wire) = self.wires.get_mut(conn_id) {
+            *wire.channel.faults_mut() = spec;
+        }
+    }
+
+    /// Re-seed the fault RNG.
+    pub fn set_seed(&mut self, seed: u32) {
+        self.rng = Mulberry32::new(seed);
+    }
+
+    // ── observation ──────────────────────────────────────────────────────
+
+    pub fn now(&self) -> f64 {
+        self.clock.now()
+    }
+
+    pub fn pending(&self) -> usize {
+        self.clock.pending()
+    }
+
+    pub fn result(&self, request_id: u64) -> Option<&CallResult> {
+        self.results.get(&request_id)
+    }
+
+    pub fn tap(&self, conn_id: &str) -> Option<&Tap> {
+        self.wires.get(conn_id).map(|w| &w.channel.tap)
+    }
+
+    /// Why a connection was refused, if it was.
+    pub fn connection_error(&self, conn_id: &str) -> Option<&str> {
+        self.wires.get(conn_id).and_then(|w| w.error.as_deref())
+    }
+
+    pub fn connection_ids(&self) -> impl Iterator<Item = &str> {
+        self.wires.keys().map(String::as_str)
+    }
+
+    /// The connections `instance_id` is an end of.
+    pub fn connections_for_instance(&self, instance_id: &str) -> Vec<String> {
+        self.wires
+            .iter()
+            .filter(|(_, w)| w.client_id == instance_id || w.server_id == instance_id)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    // ── driving ──────────────────────────────────────────────────────────
+
+    /// Frame a call on `conn_id` to `fn_name` and put the request on the wire.
+    /// Returns the request id. `Err` if the connection is unknown or refused, or
+    /// the protocol has no such function.
+    pub fn call(
+        &mut self,
+        conn_id: &str,
+        fn_name: &str,
+        params: &Value,
+    ) -> Result<u64, RuntimeError> {
+        let fmt = Json;
+        let wire = self.wires.get(conn_id).ok_or(RuntimeError::Transport)?;
+        if wire.error.is_some() {
+            return Err(RuntimeError::Handshake);
+        }
+        let function = wire
+            .dispatch
+            .protocol()
+            .functions
+            .iter()
+            .find(|f| f.name == fn_name)
+            .ok_or(RuntimeError::UnknownCall)?;
+        let call_id = function.index as u16;
+        let one_way = function.oneway;
+
+        self.next_request_id += 1;
+        let id = self.next_request_id;
+        let mut frame = Vec::new();
+        wire.framing
+            .encode_request(Call::new(call_id, ""), id, params, &fmt, &mut frame)?;
+
+        self.emit(conn_id, Direction::Request, frame);
+        if one_way {
+            self.results.insert(id, CallResult::Ok(Value::Null));
+        }
+        Ok(id)
+    }
+
+    /// Run until the event queue is empty.
+    pub fn run(&mut self) {
+        while let Some(ev) = self.clock.pop_next() {
+            self.apply(ev);
+        }
+    }
+
+    /// Fire the single earliest event. `false` if the queue was empty.
+    pub fn step(&mut self) -> bool {
+        match self.clock.pop_next() {
+            Some(ev) => {
+                self.apply(ev);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Advance virtual time by `ms`, firing every event that comes due within the
+    /// window (including ones scheduled while firing), then park at the edge.
+    pub fn advance(&mut self, ms: f64) {
+        let until = self.clock.now() + ms.max(0.0);
+        while self.clock.peek_due().is_some_and(|t| t <= until) {
+            let ev = self.clock.pop_next().unwrap();
+            self.apply(ev);
+        }
+        self.clock.park_at_least(until);
+    }
+
+    // ── internals ────────────────────────────────────────────────────────
+
+    fn apply(&mut self, ev: Event) {
+        match ev {
+            Event::DeliverToServer { conn, frame } => self.serve(&conn, &frame),
+            Event::DeliverToClient { conn, frame } => self.receive(&conn, &frame),
+            Event::FlushReorder { conn, dir } => {
+                if let Some(wire) = self.wires.get_mut(&conn) {
+                    for f in wire.channel.flush_reorder(&mut self.rng) {
+                        self.clock
+                            .schedule(0.0, deliver_event(conn.clone(), dir, f));
+                    }
+                }
+            }
+            Event::CompleteReply {
+                conn,
+                request_id,
+                outcome,
+            } => self.reply_now(&conn, request_id, outcome),
+        }
+    }
+
+    /// Hand a frame to a connection's channel and schedule whatever it decided.
+    fn emit(&mut self, conn_id: &str, dir: Direction, frame: Vec<u8>) {
+        let now = self.clock.now();
+        let Some(wire) = self.wires.get_mut(conn_id) else {
+            return;
+        };
+        let outcome = wire.channel.send(dir, &frame, now, &mut self.rng);
+        match outcome {
+            SendOutcome::Dropped => {}
+            SendOutcome::Deliver { frames, delay_ms } => {
+                for f in frames {
+                    self.clock
+                        .schedule(delay_ms, deliver_event(conn_id.to_string(), dir, f));
+                }
+            }
+            SendOutcome::Buffered { schedule_flush } => {
+                if schedule_flush {
+                    self.clock.schedule(
+                        REORDER_FLUSH_MS,
+                        Event::FlushReorder {
+                            conn: conn_id.to_string(),
+                            dir,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Server side: decode the request, run its behaviour, act on the step.
+    fn serve(&mut self, conn_id: &str, request_frame: &[u8]) {
+        let fmt = Json;
+        let Some(wire) = self.wires.get_mut(conn_id) else {
+            return;
+        };
+        let Some(req) = wire.framing.decode_request(request_frame) else {
+            return;
+        };
+        let request_id = req.request_id;
+        let step = match wire
+            .dispatch
+            .dispatch(req.call, req.params, &fmt, &mut wire.behaviors)
+        {
+            Ok(step) => step,
+            Err(_) => return,
+        };
+
+        match step {
+            BehaviorStep::Now(outcome) => self.reply_now(conn_id, request_id, outcome),
+            BehaviorStep::After { delay_ms, outcome } => self.clock.schedule(
+                delay_ms,
+                Event::CompleteReply {
+                    conn: conn_id.to_string(),
+                    request_id,
+                    outcome,
+                },
+            ),
+            BehaviorStep::Hang => {}
+            BehaviorStep::Forward {
+                via,
+                target_fn,
+                params,
+            } => self.begin_forward(conn_id, request_id, via, target_fn, params),
+        }
+    }
+
+    /// Client side: decode the response frame and settle the matching call.
+    fn receive(&mut self, conn_id: &str, response_frame: &[u8]) {
+        let fmt = Json;
+        let Some(wire) = self.wires.get(conn_id) else {
+            return;
+        };
+        let Some((request_id, envelope)) = wire.framing.decode_response(response_frame) else {
+            return;
+        };
+        let result = match envelope {
+            Envelope::Ok(payload) => match fmt.decode::<Value>(payload) {
+                Ok(value) => CallResult::Ok(value),
+                Err(_) => CallResult::Undecodable("ok body did not decode".into()),
+            },
+            Envelope::Err { id, body } => {
+                let body = if body.is_empty() {
+                    Value::Null
+                } else {
+                    fmt.decode::<Value>(body).unwrap_or(Value::Null)
+                };
+                CallResult::Err { ordinal: id, body }
+            }
+        };
+        self.settle(request_id, result);
+    }
+
+    /// Frame `outcome` as a response to `request_id` on `conn_id` and send it.
+    fn reply_now(&mut self, conn_id: &str, request_id: u64, outcome: SimOutcome) {
+        let fmt = Json;
+        let Some(wire) = self.wires.get(conn_id) else {
+            return;
+        };
+        let mut resp = Vec::new();
+        match outcome {
+            SimOutcome::Ok(value) => {
+                let mut body = Vec::new();
+                if fmt.encode(&value, &mut body).is_err() {
+                    return;
+                }
+                wire.framing
+                    .encode_response_ok(request_id, &body, &mut resp);
+            }
+            SimOutcome::Err { ordinal, data } => {
+                let mut body = Vec::new();
+                if fmt.encode(&data, &mut body).is_err() {
+                    return;
+                }
+                wire.framing
+                    .encode_response_err(request_id, ordinal, &body, &mut resp);
+            }
+            SimOutcome::None => return,
+        }
+        self.emit(conn_id, Direction::Response, resp);
+    }
+
+    /// Settle a call — either resume the forward waiting on it, or record it.
+    fn settle(&mut self, request_id: u64, result: CallResult) {
+        if let Some(cont) = self.forwards.remove(&request_id) {
+            self.forwarding.remove(&cont.via);
+            let outcome = match result {
+                CallResult::Ok(value) => SimOutcome::Ok(value),
+                CallResult::Err { ordinal, body } => SimOutcome::Err {
+                    ordinal,
+                    data: body,
+                },
+                CallResult::Undecodable(msg) => SimOutcome::Err {
+                    ordinal: 0,
+                    data: json!({ "error": msg }),
+                },
+            };
+            self.reply_now(&cont.outer_conn, cont.outer_request_id, outcome);
+        } else {
+            self.results.insert(request_id, result);
+        }
+    }
+
+    /// Relay the outer call on `via`, then answer it with the inner outcome.
+    fn begin_forward(
+        &mut self,
+        outer_conn: &str,
+        outer_request_id: u64,
+        via: String,
+        target_fn: String,
+        params: Value,
+    ) {
+        let refusal = match self.wires.get(&via) {
+            None => Some(format!("forward: no connection {via}")),
+            Some(w) if w.error.is_some() => Some(format!(
+                "forward: {via} refused ({})",
+                w.error.as_deref().unwrap()
+            )),
+            _ if self.forwarding.contains(&via) => Some("forwarding cycle".to_string()),
+            _ => None,
+        };
+        if let Some(message) = refusal {
+            self.reply_now(
+                outer_conn,
+                outer_request_id,
+                SimOutcome::Err {
+                    ordinal: 0,
+                    data: json!({ "error": message }),
+                },
+            );
+            return;
+        }
+
+        self.forwarding.insert(via.clone());
+        match self.call(&via, &target_fn, &params) {
+            Ok(inner_id) => {
+                self.forwards.insert(
+                    inner_id,
+                    ForwardCont {
+                        outer_conn: outer_conn.to_string(),
+                        outer_request_id,
+                        via,
+                    },
+                );
+            }
+            Err(_) => {
+                self.forwarding.remove(&via);
+                self.reply_now(
+                    outer_conn,
+                    outer_request_id,
+                    SimOutcome::Err {
+                        ordinal: 0,
+                        data: json!({ "error": format!("forward: {via} has no {target_fn}") }),
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// The server's per-function behaviour map for a fresh wire. Falls back to
+/// `reply` with an empty config for a function the instance never seeded
+/// (shouldn't happen — `Session` seeds every one).
+fn build_behaviors(server: &Instance, proto: &ProtocolShape, schema: &SchemaShape) -> BehaviorMap {
+    proto
+        .functions
+        .iter()
+        .map(|f| {
+            let (kind, config) = match server.behaviors.get(&f.name) {
+                Some(setting) => (setting.kind, setting.config.clone()),
+                None => (BehaviorKind::Reply, json!({})),
+            };
+            (f.name.clone(), kind.make(&config, f, schema))
+        })
+        .collect()
+}
+
+/// A 31-byte handshake frame carrying the instance's IR hash. JSON wire format,
+/// datagram framing — the axes the sim never varies.
+fn handshake_frame(ir_hash: &str) -> Vec<u8> {
+    let hash = ir_hash
+        .strip_prefix("0x")
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+        .unwrap_or(0);
+    let mut buf = Vec::new();
+    Handshake::new(hash, "json", FRAMING_DATAGRAM, 0).encode(&mut buf);
+    buf
+}
+
+/// A one-connection chat engine, shared by `smoke()` and the tests.
+pub(crate) mod chat {
+    use super::*;
+    use crate::model::{InstanceSpec, Placement, Role};
+    use crate::shape::{
+        ArgShape, FieldShape, FnShape, Framing, ProjectShape, SchemaShape, TypeDef, TypeRef,
+    };
+
+    /// The connection id `add_connection` assigns the single wire.
+    pub const CONN: &str = "c1";
+
+    pub fn shape() -> ProjectShape {
+        let string = || TypeRef::Prim {
+            name: "string".into(),
+        };
+        ProjectShape {
+            schemas: vec![SchemaShape {
+                namespace: "chat".into(),
+                ir_hash: "0x9f2b1c7d4e6a8035".into(),
+                protocols: vec![ProtocolShape {
+                    name: "Chat".into(),
+                    framing: Framing::Datagram,
+                    functions: vec![FnShape {
+                        name: "send".into(),
+                        index: 0,
+                        oneway: false,
+                        args: vec![ArgShape {
+                            name: "text".into(),
+                            ty: string(),
+                        }],
+                        returns: Some(TypeRef::Ref {
+                            name: "Message".into(),
+                        }),
+                        throws: vec![],
+                    }],
+                }],
+                errors: vec![],
+                types: vec![TypeDef::Struct {
+                    name: "Message".into(),
+                    fields: vec![
+                        FieldShape {
+                            name: "body".into(),
+                            ty: string(),
+                            optional: false,
+                        },
+                        FieldShape {
+                            name: "seq".into(),
+                            ty: TypeRef::Prim { name: "u64".into() },
+                            optional: false,
+                        },
+                    ],
+                }],
+            }],
+        }
+    }
+
+    /// `chat-1` (server, `send` → reply `{body:"HELLO",seq:1}`) with `chat-2`
+    /// (client) connected as `c1`.
+    pub fn session() -> Session {
+        let mut s = Session::empty(shape());
+        let srv = s.add_instance(
+            InstanceSpec {
+                schema_ns: "chat".into(),
+                protocol: "Chat".into(),
+                role: Role::Server,
+            },
+            Placement::default(),
+        );
+        let cli = s.add_instance(
+            InstanceSpec {
+                schema_ns: "chat".into(),
+                protocol: "Chat".into(),
+                role: Role::Client,
+            },
+            Placement::default(),
+        );
+        s.set_behavior(
+            &srv,
+            "send",
+            BehaviorKind::Reply,
+            Some(json!({ "value": { "body": "HELLO", "seq": 1 } })),
+        )
+        .unwrap();
+        s.add_connection(&cli, &srv).unwrap();
+        s
+    }
+
+    pub fn engine() -> Engine {
+        let mut e = Engine::new();
+        e.sync(&session());
+        e
+    }
+
+    #[allow(dead_code)]
+    pub fn schema() -> SchemaShape {
+        shape().schemas.into_iter().next().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chat::{self, CONN};
+    use super::*;
+    use crate::faults::FaultDir;
+    use crate::frame::FrameKind;
+    use crate::model::{InstanceSpec, Placement, Role};
+    use serde_json::json;
+
+    fn hello() -> Value {
+        json!({ "body": "HELLO", "seq": 1 })
+    }
+
+    fn client_instance(spec_role: Role) -> InstanceSpec {
+        InstanceSpec {
+            schema_ns: "chat".into(),
+            protocol: "Chat".into(),
+            role: spec_role,
+        }
+    }
+
+    /// The tap frames past the two handshake frames a clean connect records.
+    fn payload_frames(engine: &Engine, conn: &str) -> Vec<crate::frame::Frame> {
+        engine
+            .tap(conn)
+            .unwrap()
+            .frames
+            .iter()
+            .filter(|f| f.kind != FrameKind::Handshake)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn a_connect_records_a_handshake_each_way() {
+        let e = chat::engine();
+        let frames = &e.tap(CONN).unwrap().frames;
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|f| f.kind == FrameKind::Handshake));
+        assert_eq!(
+            (frames[0].from.as_str(), frames[0].to.as_str()),
+            ("chat-2", "chat-1")
+        );
+        assert_eq!(
+            (frames[1].from.as_str(), frames[1].to.as_str()),
+            ("chat-1", "chat-2")
+        );
+        assert!(e.connection_error(CONN).is_none());
+    }
+
+    #[test]
+    fn a_call_round_trips_over_the_real_contract() {
+        let mut e = chat::engine();
+        let id = e.call(CONN, "send", &json!(["hi"])).unwrap();
+        assert_eq!(e.result(id), None);
+
+        e.run();
+
+        assert_eq!(e.result(id), Some(&CallResult::Ok(hello())));
+        let p = payload_frames(&e, CONN);
+        assert_eq!(p.len(), 2, "one request, one response");
+        assert_eq!((p[0].from.as_str(), p[0].to.as_str()), ("chat-2", "chat-1"));
+        assert_eq!((p[1].from.as_str(), p[1].to.as_str()), ("chat-1", "chat-2"));
+    }
+
+    #[test]
+    fn an_unknown_or_missing_function_rejects_a_call() {
+        let mut e = chat::engine();
+        assert_eq!(
+            e.call("nope", "send", &json!([])).unwrap_err(),
+            RuntimeError::Transport
+        );
+        assert_eq!(
+            e.call(CONN, "missing", &json!([])).unwrap_err(),
+            RuntimeError::UnknownCall
+        );
+    }
+
+    #[test]
+    fn a_version_skew_refuses_the_handshake() {
+        let mut session = chat::session();
+        let server_id = session
+            .instances
+            .iter()
+            .find(|i| i.role == Role::Server)
+            .unwrap()
+            .id
+            .clone();
+        session
+            .instances
+            .iter_mut()
+            .find(|i| i.id == server_id)
+            .unwrap()
+            .ir_hash = "0xdifferent".into();
+
+        let mut e = Engine::new();
+        e.sync(&session);
+        assert_eq!(e.connection_error(CONN), Some("handshake"));
+        assert_eq!(
+            e.call(CONN, "send", &json!(["hi"])).unwrap_err(),
+            RuntimeError::Handshake
+        );
+    }
+
+    #[test]
+    fn latency_shows_up_as_virtual_time() {
+        let mut session = chat::session();
+        session.latency_ms = 50.0;
+        let mut e = Engine::new();
+        e.sync(&session);
+
+        let id = e.call(CONN, "send", &json!(["hi"])).unwrap();
+        e.run();
+        assert_eq!(e.result(id), Some(&CallResult::Ok(hello())));
+        assert_eq!(e.now(), 100.0, "50 ms each way");
+    }
+
+    #[test]
+    fn a_dropped_request_never_settles() {
+        let mut session = chat::session();
+        session.connections[0].faults.drop_prob = 1.0;
+        session.connections[0].faults.apply_to = FaultDir::Requests;
+        let mut e = Engine::new();
+        e.sync(&session);
+
+        let id = e.call(CONN, "send", &json!(["hi"])).unwrap();
+        e.run();
+        assert_eq!(e.result(id), None);
+        assert!(payload_frames(&e, CONN)
+            .iter()
+            .any(|f| f.fault.as_deref() == Some("dropped")));
+    }
+
+    #[test]
+    fn sync_is_incremental() {
+        let mut session = chat::session();
+        let mut e = Engine::new();
+        e.sync(&session);
+        let c1_tap = e.tap(CONN).unwrap() as *const Tap;
+
+        let srv = session
+            .instances
+            .iter()
+            .find(|i| i.role == Role::Server)
+            .unwrap()
+            .id
+            .clone();
+        let cli2 = session.add_instance(client_instance(Role::Client), Placement::default());
+        let c2 = session.add_connection(&cli2, &srv).unwrap();
+        e.sync(&session);
+
+        assert_eq!(
+            e.tap(CONN).unwrap() as *const Tap,
+            c1_tap,
+            "c1 left running"
+        );
+        assert!(e.tap(&c2).is_some(), "c2 opened");
+
+        session.remove_connection(&c2);
+        e.sync(&session);
+        assert!(e.tap(&c2).is_none(), "c2 closed");
+        assert!(e.tap(CONN).is_some(), "c1 still there");
+    }
+
+    #[test]
+    fn behaviour_swap_takes_effect_on_the_next_call() {
+        let session = chat::session();
+        let mut e = Engine::new();
+        e.sync(&session);
+
+        e.set_behavior(
+            CONN,
+            "send",
+            BehaviorKind::Echo,
+            &json!({}),
+            &chat::schema(),
+        )
+        .unwrap();
+        let id = e.call(CONN, "send", &json!(["echo me"])).unwrap();
+        e.run();
+        assert_eq!(e.result(id), Some(&CallResult::Ok(json!(["echo me"]))));
+    }
+
+    #[test]
+    fn forward_relays_a_call_to_a_second_connection() {
+        let mut session = chat::session(); // chat-1 (srv, replies HELLO), chat-2 (cli), c1
+        let backend = session
+            .instances
+            .iter()
+            .find(|i| i.role == Role::Server)
+            .unwrap()
+            .id
+            .clone();
+
+        let gw_client = session.add_instance(client_instance(Role::Client), Placement::default());
+        let c_gw_backend = session.add_connection(&gw_client, &backend).unwrap();
+
+        let gw_server = session.add_instance(client_instance(Role::Server), Placement::default());
+        let outer_client =
+            session.add_instance(client_instance(Role::Client), Placement::default());
+        let c_outer = session.add_connection(&outer_client, &gw_server).unwrap();
+        session
+            .set_behavior(
+                &gw_server,
+                "send",
+                BehaviorKind::Forward,
+                Some(json!({ "viaConnectionId": c_gw_backend, "targetFn": "send" })),
+            )
+            .unwrap();
+
+        let mut e = Engine::new();
+        e.sync(&session);
+        let id = e.call(&c_outer, "send", &json!(["relay me"])).unwrap();
+        e.run();
+
+        assert_eq!(e.result(id), Some(&CallResult::Ok(hello())));
+    }
+
+    #[test]
+    fn a_forwarding_cycle_is_refused() {
+        let mut session = Session::empty(chat::shape());
+        let g1s = session.add_instance(client_instance(Role::Server), Placement::default());
+        let g1c = session.add_instance(client_instance(Role::Client), Placement::default());
+        let g2s = session.add_instance(client_instance(Role::Server), Placement::default());
+        let g2c = session.add_instance(client_instance(Role::Client), Placement::default());
+        let client = session.add_instance(client_instance(Role::Client), Placement::default());
+
+        let c1_to_g2 = session.add_connection(&g1c, &g2s).unwrap();
+        let c2_to_g1 = session.add_connection(&g2c, &g1s).unwrap();
+        let c_in = session.add_connection(&client, &g1s).unwrap();
+
+        session
+            .set_behavior(
+                &g1s,
+                "send",
+                BehaviorKind::Forward,
+                Some(json!({ "viaConnectionId": c1_to_g2, "targetFn": "send" })),
+            )
+            .unwrap();
+        session
+            .set_behavior(
+                &g2s,
+                "send",
+                BehaviorKind::Forward,
+                Some(json!({ "viaConnectionId": c2_to_g1, "targetFn": "send" })),
+            )
+            .unwrap();
+
+        let mut e = Engine::new();
+        e.sync(&session);
+        let id = e.call(&c_in, "send", &json!(["loop"])).unwrap();
+        e.run();
+
+        match e.result(id) {
+            Some(CallResult::Err { ordinal: 0, body }) => {
+                assert!(body["error"].as_str().unwrap().contains("cycle"), "{body}");
+            }
+            other => panic!("expected a cycle error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reseeding_keeps_a_run_reproducible() {
+        let frames_for = |seed| {
+            let mut session = chat::session();
+            session.seed = seed;
+            session.connections[0].faults.corrupt_prob = 0.5;
+            let mut e = Engine::new();
+            e.rebuild(&session);
+            for _ in 0..8 {
+                let _ = e.call(CONN, "send", &json!(["hi"]));
+                e.run();
+            }
+            e.tap(CONN)
+                .unwrap()
+                .frames
+                .iter()
+                .map(|f| (f.bytes.clone(), f.fault.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(frames_for(7), frames_for(7));
+        assert_ne!(frames_for(7), frames_for(8));
+    }
+}

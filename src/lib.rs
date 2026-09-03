@@ -15,19 +15,19 @@
 //! - [`wire`] — one connection's tapped, fault-injecting channel
 //! - [`behavior`] — what a server instance does for one function
 //! - [`generic`] — a dispatcher driven by a [`shape::ProtocolShape`], no codegen
-//! - [`pump`] — the discrete-event pump that ties a call to its reply
 //! - [`model`] — the session: nodes, instances, connections and their operations
 //! - [`session_codec`] — the session ⇄ `#s=…` shareable link
 //! - [`record`] — record & replay input capture
+//! - [`engine`] — many connections over one clock; the discrete-event pump
 
 pub mod behavior;
 pub mod clock;
+pub mod engine;
 pub mod faults;
 pub mod format;
 pub mod frame;
 pub mod generic;
 pub mod model;
-pub mod pump;
 pub mod record;
 pub mod rng;
 pub mod session_codec;
@@ -36,19 +36,20 @@ pub mod wire;
 
 use wasm_bindgen::prelude::*;
 
-use pump::Pump;
-
-/// WASM smoke test: run one `send` call through the pump and return the frame
+/// WASM smoke test: run one `send` call through the engine and return the frame
 /// log as a JSON string (or `"error: …"`). The playground's real surface lands
 /// here as the port progresses.
 #[wasm_bindgen]
 pub fn smoke() -> String {
-    let mut pump = Pump::new();
-    if let Err(e) = pump.call("send", &serde_json::json!(["hi"])) {
+    let mut sim = engine::chat::engine();
+    if let Err(e) = sim.call(engine::chat::CONN, "send", &serde_json::json!(["hi"])) {
         return format!("error: {e:?}");
     }
-    pump.run();
-    serde_json::to_string(&pump.tap().frames).unwrap_or_else(|_| "[]".into())
+    sim.run();
+    match sim.tap(engine::chat::CONN) {
+        Some(tap) => serde_json::to_string(&tap.frames).unwrap_or_else(|_| "[]".into()),
+        None => "[]".into(),
+    }
 }
 
 #[cfg(test)]
@@ -56,11 +57,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn smoke_logs_a_request_and_a_response() {
+    fn smoke_logs_a_handshake_a_request_and_a_response() {
         let log = smoke();
-        let frames: serde_json::Value = serde_json::from_str(&log).unwrap();
-        assert_eq!(frames.as_array().unwrap().len(), 2);
-        assert_eq!(frames[0]["from"], "client");
-        assert_eq!(frames[1]["from"], "server");
+        let frames: Vec<serde_json::Value> = serde_json::from_str(&log).unwrap();
+        // two handshake frames, then the request and the response
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[0]["kind"], "handshake");
+        assert_eq!(frames[2]["kind"], "request");
+        assert_eq!(frames[2]["from"], "chat-2");
+        assert_eq!(frames[3]["from"], "chat-1");
     }
 }
