@@ -6,6 +6,10 @@
 # Needs a Rust toolchain. Installs the wasm32 target and the wasm-bindgen CLI
 # pinned to the crate's version (a one-time few-minute compile per machine,
 # cached in ~/.cargo afterwards). `wasm-opt`, if on PATH, trims the binary.
+#
+# Builds both feature sets — `pkg/` (lean, no Rhai) and `pkg-script/`
+# (scripted). Set COMLINE_SIMULATOR_SCRIPT=0 to skip the scripted one if you
+# only need the lean module.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -23,4 +27,8 @@ if ! wasm-bindgen --version 2>/dev/null | grep -qx "wasm-bindgen $wb"; then
 	cargo install wasm-bindgen-cli --version "=$wb" --locked
 fi
 
-exec bash scripts/build-wasm.sh pkg comline_simulator --no-default-features
+bash scripts/build-wasm.sh pkg comline_simulator --no-default-features
+
+if [ "${COMLINE_SIMULATOR_SCRIPT:-1}" != "0" ]; then
+	bash scripts/build-wasm.sh pkg-script comline_simulator
+fi

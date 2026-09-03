@@ -74,8 +74,14 @@ install:
 
 `npm install` clones the repo at that SHA and runs `prepare` (→ `scripts/
 prepare.sh`, which provisions the wasm target + `wasm-bindgen-cli` and calls
-`build-wasm.sh`), leaving `pkg/` — `import init, { Sim } from "comline-simulator"`.
-A Rust toolchain has to be on the machine / CI doing the install.
+`build-wasm.sh`). It leaves two builds:
+
+- `pkg/` — lean. `import init, { Sim } from "comline-simulator"`
+- `pkg-script/` — Rhai scripting. `import … from "comline-simulator/pkg-script/comline_simulator.js"`
+  (the playground lazy-loads this)
+
+Set `COMLINE_SIMULATOR_SCRIPT=0` before the install to skip `pkg-script/`. A
+Rust toolchain has to be on the machine / CI doing the install.
 
 ## Dev note — the `script` feature & wasm size
 
