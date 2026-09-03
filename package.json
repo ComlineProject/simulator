@@ -1,0 +1,16 @@
+{
+  "name": "comline-simulator",
+  "version": "0.0.0",
+  "description": "The Comline playground / tutorial simulation engine — Rust → WASM.",
+  "license": "MPL-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/ComlineProject/simulator.git" },
+  "type": "module",
+  "main": "pkg/comline_simulator.js",
+  "module": "pkg/comline_simulator.js",
+  "types": "pkg/comline_simulator.d.ts",
+  "files": ["pkg"],
+  "sideEffects": ["./pkg/comline_simulator.js"],
+  "scripts": {
+    "prepare": "bash scripts/prepare.sh"
+  }
+}

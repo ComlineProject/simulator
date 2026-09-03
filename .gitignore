@@ -1,4 +1,5 @@
+# Cargo.lock is committed — consumers build this crate on `npm install`
+# (git dependency + `prepare`), so the resolve needs to be pinned.
 /target
 /pkg
-Cargo.lock
 /pkg-script

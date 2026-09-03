@@ -53,9 +53,29 @@ src/facade.rs        the #[wasm_bindgen] Sim surface
 ```sh
 cargo test                                            # native
 cargo test --no-default-features                       # without scripting
-wasm-pack build --release --target web                 # → pkg/
-wasm-pack build --release --target web -- --no-default-features
+
+scripts/build-wasm.sh pkg comline_simulator --no-default-features   # lean → pkg/
+scripts/build-wasm.sh pkg-script comline_simulator                  # scripted
 ```
+
+`build-wasm.sh` is `cargo build --target wasm32-unknown-unknown` → `wasm-bindgen
+--target web` → `wasm-opt` (no wasm-pack — that's under the sunset rustwasm
+org). It needs `wasm-bindgen` (the CLI, matching the crate's version) and,
+optionally, `wasm-opt`.
+
+## Consuming it
+
+The playground and tutorial take this as a **git dependency** and build it on
+install:
+
+```jsonc
+"comline-simulator": "github:ComlineProject/simulator#<sha>"
+```
+
+`npm install` clones the repo at that SHA and runs `prepare` (→ `scripts/
+prepare.sh`, which provisions the wasm target + `wasm-bindgen-cli` and calls
+`build-wasm.sh`), leaving `pkg/` — `import init, { Sim } from "comline-simulator"`.
+A Rust toolchain has to be on the machine / CI doing the install.
 
 ## Dev note — the `script` feature & wasm size
 
