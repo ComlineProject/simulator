@@ -27,8 +27,14 @@ jobs:
       - name: Test (native)
         run: cargo test
 
+      - name: Test (no scripting)
+        run: cargo test --no-default-features
+
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM
         run: wasm-pack build --release --target web
+
+      - name: Build WASM (no scripting)
+        run: wasm-pack build --release --target web -- --no-default-features
