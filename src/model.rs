@@ -97,11 +97,15 @@ pub struct Session {
     pub instances: Vec<Instance>,
     pub connections: Vec<Connection>,
     /// Fixed per-frame delivery delay for every wire, ms.
+    #[serde(default)]
     pub latency_ms: f64,
     /// How long a client waits for a reply before it gives up.
+    #[serde(default = "default_call_timeout_ms")]
     pub call_timeout_ms: f64,
     /// Seeds the fault RNG — a stepped run with a fixed seed is reproducible.
+    #[serde(default = "default_seed")]
     pub seed: u32,
+    #[serde(default = "default_clock_mode")]
     pub clock_mode: ClockMode,
     /// Monotonic id counters. Not serialized; [`Session::reseed_counters`]
     /// rebuilds them past everything in a loaded session.
@@ -111,6 +115,17 @@ pub struct Session {
     next_node: u64,
     #[serde(skip)]
     next_conn: u64,
+}
+
+// Defaults for a partial session link — mirror `decodeSession`'s `Number(…) || …`.
+fn default_call_timeout_ms() -> f64 {
+    3000.0
+}
+fn default_seed() -> u32 {
+    1
+}
+fn default_clock_mode() -> ClockMode {
+    ClockMode::Real
 }
 
 /// Where a freshly-added instance goes on the canvas.

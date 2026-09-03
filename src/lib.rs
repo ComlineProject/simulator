@@ -17,6 +17,8 @@
 //! - [`generic`] — a dispatcher driven by a [`shape::ProtocolShape`], no codegen
 //! - [`pump`] — the discrete-event pump that ties a call to its reply
 //! - [`model`] — the session: nodes, instances, connections and their operations
+//! - [`session_codec`] — the session ⇄ `#s=…` shareable link
+//! - [`record`] — record & replay input capture
 
 pub mod behavior;
 pub mod clock;
@@ -26,7 +28,9 @@ pub mod frame;
 pub mod generic;
 pub mod model;
 pub mod pump;
+pub mod record;
 pub mod rng;
+pub mod session_codec;
 pub mod shape;
 pub mod wire;
 
