@@ -77,6 +77,27 @@ impl Sim {
         Ok(())
     }
 
+    /// Snap one instance's stored `irHash` forward to the current schema, then
+    /// re-open every wire — the recovery half of the version-skew demo.
+    pub fn resync_instance(&mut self, id: &str) {
+        self.session.resync_instance(id);
+        self.engine.rebuild(&self.session);
+    }
+
+    /// Snap every instance's `irHash` forward.
+    pub fn resync_all(&mut self) {
+        let ids: Vec<String> = self
+            .session
+            .instances
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        for id in ids {
+            self.session.resync_instance(&id);
+        }
+        self.engine.rebuild(&self.session);
+    }
+
     // ── topology ─────────────────────────────────────────────────────────
 
     /// `spec_json`: `{ "schemaNs", "protocol", "role", "nodeId"?, "x"?, "y"? }`.
@@ -667,6 +688,35 @@ mod tests {
         assert_eq!(
             s.connection_error(chat::CONN).as_deref(),
             Some("json-rpc framing requires the json codec")
+        );
+    }
+
+    #[test]
+    fn resync_instance_recovers_a_version_skew() {
+        let mut s = Sim::try_new(&serde_json::to_string(&chat::shape()).unwrap(), None).unwrap();
+        s.session = chat::session();
+        // skew the server's ir_hash so the handshake is refused
+        let srv = s
+            .session
+            .instances
+            .iter()
+            .find(|i| i.role == Role::Server)
+            .unwrap()
+            .id
+            .clone();
+        s.session
+            .instances
+            .iter_mut()
+            .find(|i| i.id == srv)
+            .unwrap()
+            .ir_hash = "0xskew".into();
+        s.engine.rebuild(&s.session);
+        assert_eq!(s.connection_error(chat::CONN).as_deref(), Some("handshake"));
+
+        s.resync_instance(&srv);
+        assert!(
+            s.connection_error(chat::CONN).is_none(),
+            "resynced → connected"
         );
     }
 
