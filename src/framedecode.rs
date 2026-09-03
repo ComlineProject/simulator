@@ -197,8 +197,8 @@ pub fn to_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::chat;
     use crate::engine::Engine;
+    use crate::fixtures as chat;
     use serde_json::json;
 
     fn detail(engine: &Engine, conn: &str, seq: u32) -> FrameDetail {
@@ -234,7 +234,7 @@ mod tests {
         let h = hs.handshake.unwrap();
         assert_eq!(h.wire_format, "json");
         assert_eq!(h.framing, WireFraming::Datagram.name());
-        assert_eq!(h.ir_hash, "0x9f2b1c7d4e6a8035");
+        assert_eq!(h.ir_hash, "0x9f2b1c7d4e6a8035"); // the `chat` fixture's placeholder hash
 
         let req = detail(&e, chat::CONN, 3);
         assert_eq!(req.kind, "request");
