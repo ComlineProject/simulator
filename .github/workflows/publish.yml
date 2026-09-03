@@ -1,0 +1,86 @@
+name: Publish WASM package
+
+# Builds the `Sim` facade to WASM (wasm-bindgen — no wasm-pack) and publishes
+# it to GitHub Packages so the playground and tutorial consume one artifact
+# instead of each carrying a wrapper crate:
+#   @comlineproject/simulator         lean  (--no-default-features, no Rhai)
+#   @comlineproject/simulator-script  scripted (default features, Rhai)
+# Version is 0.0.0-<run number>; every push to main publishes a new one under
+# the `latest` dist-tag.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable && rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo + installed tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.toml') }}
+
+      - name: wasm-bindgen CLI (matched to the crate)
+        run: |
+          wb=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          wasm-bindgen --version 2>/dev/null | grep -qx "wasm-bindgen $wb" \
+            || cargo install wasm-bindgen-cli --version "=$wb" --locked
+
+      - name: wasm-opt
+        run: command -v wasm-opt || (sudo apt-get update -qq && sudo apt-get install -y -qq binaryen)
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: '@comlineproject'
+
+      - name: Build
+        run: |
+          scripts/build-wasm.sh pkg        comline_simulator --no-default-features
+          scripts/build-wasm.sh pkg-script comline_simulator
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: 0.0.0-${{ github.run_number }}
+        run: |
+          set -eu
+          publish() {
+            dir=$1 name=$2
+            node --eval '
+              const fs = require("fs"), [dir, name, version] = process.argv.slice(1);
+              fs.writeFileSync(`${dir}/package.json`, JSON.stringify({
+                name, version, type: "module",
+                description: "The Comline playground / tutorial simulation engine — Rust → WASM.",
+                license: "MPL-2.0",
+                repository: { type: "git", url: "git+https://github.com/ComlineProject/simulator.git" },
+                files: ["comline_simulator_bg.wasm", "comline_simulator.js", "comline_simulator.d.ts"],
+                main: "comline_simulator.js", module: "comline_simulator.js",
+                types: "comline_simulator.d.ts", sideEffects: ["./comline_simulator.js"]
+              }, null, 2) + "\n");
+            ' "$dir" "$name" "$VERSION"
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "$name@$VERSION already published — skipping"
+            else
+              (cd "$dir" && npm publish --tag latest)
+            fi
+          }
+          publish pkg        '@comlineproject/simulator'
+          publish pkg-script '@comlineproject/simulator-script'

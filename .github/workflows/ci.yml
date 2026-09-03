@@ -15,14 +15,15 @@ jobs:
       - name: Rust toolchain
         run: rustup update stable && rustup default stable && rustup target add wasm32-unknown-unknown
 
-      - name: Cache cargo
+      - name: Cache cargo + installed tools
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
+          key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.toml') }}
 
       - name: Test (native)
         run: cargo test
@@ -30,11 +31,16 @@ jobs:
       - name: Test (no scripting)
         run: cargo test --no-default-features
 
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: wasm-bindgen CLI (matched to the crate)
+        run: |
+          wb=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          wasm-bindgen --version 2>/dev/null | grep -qx "wasm-bindgen $wb" \
+            || cargo install wasm-bindgen-cli --version "=$wb" --locked
 
-      - name: Build WASM
-        run: wasm-pack build --release --target web
+      - name: wasm-opt
+        run: command -v wasm-opt || (sudo apt-get update -qq && sudo apt-get install -y -qq binaryen)
 
-      - name: Build WASM (no scripting)
-        run: wasm-pack build --release --target web -- --no-default-features
+      - name: Build WASM (scripted + lean)
+        run: |
+          scripts/build-wasm.sh pkg-script comline_simulator
+          scripts/build-wasm.sh pkg        comline_simulator --no-default-features
