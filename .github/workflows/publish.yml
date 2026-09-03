@@ -1,0 +1,71 @@
+name: Publish WASM package
+
+# Builds the `Sim` facade to WASM and publishes it to GitHub Packages so the
+# playground and tutorial consume one artifact instead of each carrying a
+# wrapper crate:
+#   @comlineproject/simulator         lean  (--no-default-features, no Rhai)
+#   @comlineproject/simulator-script  scripted (default features, Rhai)
+# Version is 0.0.0-<run number>; every push to main publishes a new one and
+# moves the `latest` dist-tag.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: rustup update stable && rustup default stable && rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: '@comlineproject'
+
+      - name: Build WASM (lean) and scripted
+        run: |
+          wasm-pack build --release --target web --out-dir pkg -- --no-default-features
+          wasm-pack build --release --target web --out-dir pkg-script
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: 0.0.0-${{ github.run_number }}
+        run: |
+          set -eu
+          publish() {
+            dir=$1 name=$2
+            ( cd "$dir"
+              npm pkg set name="$name"
+              npm version "$VERSION" --no-git-tag-version --allow-same-version >/dev/null
+              if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+                echo "$name@$VERSION already published — skipping"
+              else
+                npm publish --tag latest
+              fi
+            )
+          }
+          publish pkg        '@comlineproject/simulator'
+          publish pkg-script '@comlineproject/simulator-script'
