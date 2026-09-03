@@ -1,0 +1,37 @@
+{
+  "schemas": [
+    {
+      "namespace": "chat",
+      "ir_hash": "0x9f2b1c7d4e6a8035",
+      "protocols": [
+        {
+          "name": "Chat",
+          "framing": "datagram",
+          "functions": [
+            {
+              "name": "send",
+              "index": 0,
+              "oneway": false,
+              "args": [
+                { "name": "text", "ty": { "kind": "prim", "name": "string" } }
+              ],
+              "returns": { "kind": "ref", "name": "Message" },
+              "throws": []
+            }
+          ]
+        }
+      ],
+      "errors": [],
+      "types": [
+        {
+          "kind": "struct",
+          "name": "Message",
+          "fields": [
+            { "name": "body", "ty": { "kind": "prim", "name": "string" }, "optional": false },
+            { "name": "seq", "ty": { "kind": "prim", "name": "u64" }, "optional": false }
+          ]
+        }
+      ]
+    }
+  ]
+}

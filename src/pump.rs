@@ -5,27 +5,31 @@
 //! back and [`Pump::result`] can read it.
 //!
 //! This is where the playground's `engine.ts` / `generic.ts` round-trip lives,
-//! minus the `async` `Client` / `Server`: the runtime's `Framing` + `Dispatch`
-//! primitives are enough when the pump owns the schedule.
+//! minus the `async` `Client` / `Server`: the runtime's `Framing` primitives
+//! plus [`GenericDispatch`] are enough when the pump owns the schedule.
 //!
-//! Scope note: one hard-wired `client ↔ server` connection and a
-//! reply-with-a-constant [`ConstDispatch`]. The next slice swaps in a
-//! `GenericDispatch` built from the compiled IR and a client keyed by function.
+//! Scope note: still one hard-wired `client ↔ server` connection. Many
+//! connections, nodes and the incremental `Wires` diff come with the `model` /
+//! `engine` port.
 
 use std::collections::HashMap;
 
 use comline_runtime::contract::{
-    Call, DatagramFraming, Dispatch, Envelope, Framing, Kind, Outcome, Reply, RequestCall,
-    RuntimeError, WireFormat,
+    Call, DatagramFraming, Envelope, Framing, Outcome, Reply, RuntimeError, WireFormat,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::behavior::{Behavior, ReplyWith};
 use crate::clock::Clock;
 use crate::faults::{Direction, FaultSpec};
 use crate::format::Json;
 use crate::frame::Tap;
+use crate::generic::{BehaviorMap, GenericDispatch};
 use crate::rng::Mulberry32;
+use crate::shape::{
+    find_protocol, zero_value, FnShape, Framing as ShapeFraming, ProjectShape, ProtocolShape,
+    SchemaShape, TypeDef, TypeRef,
+};
 use crate::wire::{Channel, SendOutcome, REORDER_FLUSH_MS};
 
 /// What a settled call produced.
@@ -62,7 +66,8 @@ pub struct Pump {
     clock: Clock<Event>,
     rng: Mulberry32,
     channel: Channel,
-    dispatch: ConstDispatch,
+    dispatch: GenericDispatch,
+    behaviors: BehaviorMap,
     fmt: Json,
     framing: DatagramFraming,
     next_request_id: u64,
@@ -76,17 +81,40 @@ impl Default for Pump {
 }
 
 impl Pump {
+    /// A pump over the built-in chat protocol, `send` seeded to reply with a
+    /// fixed message — the shape `smoke()` and the tests drive.
     pub fn new() -> Self {
-        Self {
+        let mut pump = Self::from_shape(&chat_shape(), "chat", "Chat")
+            .expect("the built-in chat shape has a Chat protocol");
+        pump.set_behavior(
+            "send",
+            Box::new(ReplyWith {
+                value: serde_json::json!({ "body": "HELLO", "seq": 1 }),
+            }),
+        );
+        pump
+    }
+
+    /// A pump for the `ns::protocol` of a compiled project. Every function is
+    /// seeded with "reply with the zero value of its return type"; the caller
+    /// then swaps in the behaviours the session wants. `None` if the protocol
+    /// isn't in the shape, or isn't datagram-framed (JSON-RPC comes later).
+    pub fn from_shape(shape: &ProjectShape, ns: &str, protocol: &str) -> Option<Self> {
+        let (schema, proto) = find_protocol(shape, ns, protocol)?;
+        if proto.framing != ShapeFraming::Datagram {
+            return None;
+        }
+        Some(Self {
             clock: Clock::new(),
             rng: Mulberry32::new(1),
             channel: Channel::new("client", "server"),
-            dispatch: ConstDispatch::new(),
+            behaviors: default_behaviors(proto, &schema.types),
+            dispatch: GenericDispatch::new(proto.clone()),
             fmt: Json,
             framing: DatagramFraming,
             next_request_id: 0,
             results: HashMap::new(),
-        }
+        })
     }
 
     // ── knobs ─────────────────────────────────────────────────────────────
@@ -104,6 +132,11 @@ impl Pump {
         self.rng = Mulberry32::new(seed);
     }
 
+    /// Swap the server behaviour for `fn_name`; takes effect on the next call.
+    pub fn set_behavior(&mut self, fn_name: &str, behavior: Box<dyn Behavior>) {
+        self.behaviors.insert(fn_name.to_string(), behavior);
+    }
+
     // ── observation ──────────────────────────────────────────────────────
 
     pub fn now(&self) -> f64 {
@@ -118,6 +151,10 @@ impl Pump {
         &self.channel.tap
     }
 
+    pub fn protocol(&self) -> &ProtocolShape {
+        self.dispatch.protocol()
+    }
+
     /// The outcome of the call with request id `id`, once it has settled.
     pub fn result(&self, id: u64) -> Option<&CallResult> {
         self.results.get(&id)
@@ -125,15 +162,32 @@ impl Pump {
 
     // ── driving ──────────────────────────────────────────────────────────
 
-    /// Frame a call to function `call_id` with `params` and put the request on
-    /// the wire. Returns the request id to read the result back with.
-    pub fn call(&mut self, call_id: u16, params: &Value) -> Result<u64, RuntimeError> {
+    /// Frame a call to the function named `fn_name` with `params` and put the
+    /// request on the wire. Returns the request id, or [`RuntimeError::UnknownCall`]
+    /// if the protocol has no such function.
+    pub fn call(&mut self, fn_name: &str, params: &Value) -> Result<u64, RuntimeError> {
+        let function = self
+            .dispatch
+            .protocol()
+            .functions
+            .iter()
+            .find(|f| f.name == fn_name)
+            .ok_or(RuntimeError::UnknownCall)?;
+        let call_id = function.index as u16;
+        let one_way = function.oneway;
+
         self.next_request_id += 1;
         let id = self.next_request_id;
         let mut frame = Vec::new();
         self.framing
-            .encode_request(Call::from(call_id), id, params, &self.fmt, &mut frame)?;
+            .encode_request(Call::new(call_id, ""), id, params, &self.fmt, &mut frame)?;
         self.emit(Direction::Request, frame);
+
+        // a one-way call never gets a response — settle it now so callers that
+        // poll `result` aren't left waiting.
+        if one_way {
+            self.results.insert(id, CallResult::Ok(Value::Null));
+        }
         Ok(id)
     }
 
@@ -210,22 +264,20 @@ impl Pump {
         let Some(req) = self.framing.decode_request(request_frame) else {
             return;
         };
-        let call = match req.call {
-            RequestCall::Id(id) => Kind::Id(id),
-            // datagram framing never puts a name on the wire
-            RequestCall::Name(_) => return,
-        };
         let request_id = req.request_id;
 
         let mut body = Vec::new();
         let outcome = {
             let mut reply = Reply::new(&mut body);
-            match self
-                .dispatch
-                .dispatch(call, req.params, &self.fmt, &mut reply)
-            {
+            match self.dispatch.dispatch(
+                req.call,
+                req.params,
+                &self.fmt,
+                &mut self.behaviors,
+                &mut reply,
+            ) {
                 Ok(()) => reply.outcome(),
-                // the next slice frames this as an error response
+                // a schema-less dispatch failure — no response, the call times out
                 Err(_) => return,
             }
         };
@@ -266,62 +318,76 @@ impl Pump {
     }
 }
 
-// ── a stand-in dispatcher: replies to `send` with a constant ──────────────
-//
-// Replaced in the next slice by a `GenericDispatch` reading the compiled IR.
-
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
-struct Message {
-    body: String,
-    seq: u64,
+/// "Reply with the zero value of the return type" for every function — the
+/// starting behaviour a freshly-placed server instance runs.
+fn default_behaviors(proto: &ProtocolShape, types: &[TypeDef]) -> BehaviorMap {
+    proto
+        .functions
+        .iter()
+        .map(|f| {
+            let value = f
+                .returns
+                .as_ref()
+                .map_or(Value::Null, |r| zero_value(r, types));
+            (
+                f.name.clone(),
+                Box::new(ReplyWith { value }) as Box<dyn Behavior>,
+            )
+        })
+        .collect()
 }
 
-const CONST_CALLS: &[&str] = &["send"];
-
-struct ConstDispatch {
-    reply: Vec<u8>,
-}
-
-impl ConstDispatch {
-    fn new() -> Self {
-        let mut reply = Vec::new();
-        Json.encode(
-            &Message {
-                body: "HELLO".into(),
-                seq: 1,
-            },
-            &mut reply,
-        )
-        .expect("encode the canned reply");
-        Self { reply }
-    }
-}
-
-impl Dispatch for ConstDispatch {
-    fn calls(&self) -> &'static [&'static str] {
-        CONST_CALLS
-    }
-
-    fn dispatch<W: WireFormat>(
-        &self,
-        call: Kind,
-        _params: &[u8],
-        _format: &W,
-        reply: &mut Reply,
-    ) -> Result<(), RuntimeError> {
-        match call.resolve(CONST_CALLS) {
-            Some(0) => {
-                reply.ok(&self.reply);
-                Ok(())
-            }
-            _ => Err(RuntimeError::UnknownCall),
-        }
+/// The built-in chat shape `Pump::new` drives — the same one the `shape.rs`
+/// fixture pins the deserialization of.
+fn chat_shape() -> ProjectShape {
+    let string = || TypeRef::Prim {
+        name: "string".into(),
+    };
+    ProjectShape {
+        schemas: vec![SchemaShape {
+            namespace: "chat".into(),
+            ir_hash: "0x9f2b1c7d4e6a8035".into(),
+            protocols: vec![ProtocolShape {
+                name: "Chat".into(),
+                framing: ShapeFraming::Datagram,
+                functions: vec![FnShape {
+                    name: "send".into(),
+                    index: 0,
+                    oneway: false,
+                    args: vec![crate::shape::ArgShape {
+                        name: "text".into(),
+                        ty: string(),
+                    }],
+                    returns: Some(TypeRef::Ref {
+                        name: "Message".into(),
+                    }),
+                    throws: vec![],
+                }],
+            }],
+            errors: vec![],
+            types: vec![TypeDef::Struct {
+                name: "Message".into(),
+                fields: vec![
+                    crate::shape::FieldShape {
+                        name: "body".into(),
+                        ty: string(),
+                        optional: false,
+                    },
+                    crate::shape::FieldShape {
+                        name: "seq".into(),
+                        ty: TypeRef::Prim { name: "u64".into() },
+                        optional: false,
+                    },
+                ],
+            }],
+        }],
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::behavior::Echo;
     use serde_json::json;
 
     fn hello() -> Value {
@@ -331,7 +397,7 @@ mod tests {
     #[test]
     fn a_call_round_trips_over_the_real_contract() {
         let mut pump = Pump::new();
-        let id = pump.call(0, &json!(["hi"])).unwrap();
+        let id = pump.call("send", &json!(["hi"])).unwrap();
         assert_eq!(pump.result(id), None, "not settled until the pump runs");
 
         pump.run();
@@ -350,10 +416,51 @@ mod tests {
     }
 
     #[test]
+    fn calls_resolve_by_function_name() {
+        let mut pump = Pump::new();
+        assert_eq!(
+            pump.call("nope", &json!([])).unwrap_err(),
+            RuntimeError::UnknownCall
+        );
+    }
+
+    #[test]
+    fn a_generic_dispatch_behaviour_swap_takes_effect_next_call() {
+        let mut pump = Pump::new();
+        pump.set_behavior("send", Box::new(Echo));
+
+        let id = pump.call("send", &json!(["echo me"])).unwrap();
+        pump.run();
+        assert_eq!(pump.result(id), Some(&CallResult::Ok(json!(["echo me"]))));
+    }
+
+    #[test]
+    fn from_shape_seeds_the_zero_value_reply() {
+        let shape: ProjectShape =
+            serde_json::from_str(include_str!("../tests/fixtures/chat.describe.json")).unwrap();
+        let mut pump = Pump::from_shape(&shape, "chat", "Chat").unwrap();
+
+        let id = pump.call("send", &json!(["hi"])).unwrap();
+        pump.run();
+        // Message's zero value: body "", seq 0
+        assert_eq!(
+            pump.result(id),
+            Some(&CallResult::Ok(json!({ "body": "", "seq": 0 })))
+        );
+    }
+
+    #[test]
+    fn from_shape_is_none_for_a_missing_protocol() {
+        let shape = chat_shape();
+        assert!(Pump::from_shape(&shape, "chat", "Missing").is_none());
+        assert!(Pump::from_shape(&shape, "nope", "Chat").is_none());
+    }
+
+    #[test]
     fn latency_shows_up_as_virtual_time() {
         let mut pump = Pump::new();
         pump.set_latency(50.0);
-        let id = pump.call(0, &json!(["hi"])).unwrap();
+        let id = pump.call("send", &json!(["hi"])).unwrap();
         pump.run();
 
         assert_eq!(pump.result(id), Some(&CallResult::Ok(hello())));
@@ -368,7 +475,7 @@ mod tests {
         pump.faults_mut().drop_prob = 1.0;
         pump.faults_mut().apply_to = crate::faults::FaultDir::Requests;
 
-        let id = pump.call(0, &json!(["hi"])).unwrap();
+        let id = pump.call("send", &json!(["hi"])).unwrap();
         pump.run();
 
         assert_eq!(pump.result(id), None);
@@ -382,7 +489,7 @@ mod tests {
         pump.faults_mut().corrupt_prob = 1.0;
         pump.faults_mut().apply_to = crate::faults::FaultDir::Responses;
 
-        let id = pump.call(0, &json!(["hi"])).unwrap();
+        let id = pump.call("send", &json!(["hi"])).unwrap();
         pump.run();
 
         match pump.result(id) {
@@ -400,7 +507,7 @@ mod tests {
     fn step_fires_one_event_at_a_time() {
         let mut pump = Pump::new();
         pump.set_latency(10.0);
-        let id = pump.call(0, &json!(["hi"])).unwrap();
+        let id = pump.call("send", &json!(["hi"])).unwrap();
 
         assert_eq!(pump.pending(), 1, "request delivery queued");
         assert!(pump.step()); // deliver request → server replies → response queued
@@ -416,7 +523,7 @@ mod tests {
     fn advance_fires_the_whole_chain_within_the_window() {
         let mut pump = Pump::new();
         pump.set_latency(30.0);
-        let id = pump.call(0, &json!(["hi"])).unwrap();
+        let id = pump.call("send", &json!(["hi"])).unwrap();
 
         pump.advance(10.0); // nothing due yet (first delivery at t=30)
         assert_eq!(pump.result(id), None);
@@ -434,7 +541,7 @@ mod tests {
             pump.set_seed(seed);
             pump.faults_mut().corrupt_prob = 0.5;
             for _ in 0..8 {
-                let _ = pump.call(0, &json!(["hi"]));
+                let _ = pump.call("send", &json!(["hi"]));
                 pump.run();
             }
             pump.tap()
