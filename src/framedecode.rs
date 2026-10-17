@@ -32,6 +32,9 @@ pub struct FrameDetail {
     /// response: a raised error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub err: Option<ErrDetail>,
+    /// response: the provider faulted. No ordinal and no body to show.
+    #[serde(skip_serializing_if = "core::ops::Not::not")]
+    pub fault: bool,
     /// handshake: the fields it carries (names resolved where known).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handshake: Option<HandshakeDetail>,
@@ -72,6 +75,7 @@ impl FrameDetail {
             params: None,
             ok: None,
             err: None,
+            fault: false,
             handshake: None,
         }
     }
@@ -181,6 +185,7 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
                 d.framing = "undecodable".into();
             }
         }
+        Envelope::Fault => d.fault = true,
     }
     d
 }
@@ -263,6 +268,37 @@ mod tests {
         let res = detail(&e, chat::CONN, 4);
         assert_eq!(res.kind, "response");
         assert_eq!(res.framing, "undecodable");
+    }
+
+    #[test]
+    fn a_fault_frame_is_a_response_with_no_ordinal_and_no_body() {
+        let mut session = chat::session();
+        session
+            .set_behavior(
+                &session
+                    .instances
+                    .iter()
+                    .find(|i| i.role == crate::model::Role::Server)
+                    .unwrap()
+                    .id
+                    .clone(),
+                "send",
+                crate::behavior::BehaviorKind::Fault,
+                Some(json!({})),
+            )
+            .unwrap();
+        let mut e = Engine::new();
+        e.sync(&session);
+        e.call(chat::CONN, "send", &json!(["hi"])).unwrap();
+        e.run();
+
+        let res = detail(&e, chat::CONN, 4);
+        assert_eq!(res.kind, "response");
+        assert!(res.fault, "the inspector shows it as a fault");
+        assert!(res.err.is_none(), "a fault has no ordinal to show");
+        assert!(res.ok.is_none());
+        // and it is not reported as a broken frame
+        assert_ne!(res.framing, "undecodable");
     }
 
     #[test]

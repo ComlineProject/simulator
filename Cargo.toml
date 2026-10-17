@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # format. `alloc` only: `std` pulls `libloading` (dylib) which won't build for
 # wasm32. The simulator supplies its own `WireFormat` (JSON), tapped transport
 # and pump on top of these.
-comline-runtime = { git = "https://github.com/ComlineProject/runtime", rev = "0dda42de5105e75e339bf66fa38085bd53ab9ab9", default-features = false, features = ["alloc"] }
+comline-runtime = { git = "https://github.com/ComlineProject/runtime", rev = "ae214701b08521f2e0f0a480afa387d0ec4d646c", default-features = false, features = ["alloc"] }
 
 serde = { version = "1", features = ["derive"] }
 # `raw_value` lets the JSON-RPC framing splice an already-encoded params / body

@@ -30,6 +30,7 @@ fn call_result_json(result: &CallResult) -> Value {
             json!({ "status": "err", "ordinal": ordinal, "body": body })
         }
         CallResult::Undecodable(message) => json!({ "status": "undecodable", "message": message }),
+        CallResult::Fault => json!({ "status": "fault" }),
         CallResult::Timeout => json!({ "status": "timeout" }),
     }
 }
@@ -726,7 +727,7 @@ mod tests {
 
         let catalog: Vec<Value> =
             serde_json::from_str(&s.behavior_catalog("chat", "Chat", "send")).unwrap();
-        assert_eq!(catalog.len(), 8);
+        assert_eq!(catalog.len(), 9);
 
         let by_kind = |k: &str| {
             catalog.iter().find(|e| e["kind"] == k).unwrap()["applies"]
@@ -736,6 +737,7 @@ mod tests {
         assert!(by_kind("reply"));
         assert!(by_kind("increment")); // send returns a struct ref
         assert!(!by_kind("raise")); // send has no throws
+        assert!(by_kind("fault")); // ... but it can still fail: that is the channel
         assert!(by_kind("script"));
 
         assert_eq!(s.behavior_catalog("chat", "Chat", "nope"), "[]");

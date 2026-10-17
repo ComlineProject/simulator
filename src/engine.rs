@@ -37,6 +37,9 @@ pub enum CallResult {
     Ok(Value),
     /// A raised schema error: its schema-global `ordinal` and decoded `body`.
     Err { ordinal: u16, body: Value },
+    /// The provider failed and the schema declares no error for it. There is no
+    /// ordinal and no body — a fault is opaque by design.
+    Fault,
     /// The response frame arrived but its body would not decode — e.g. a
     /// corrupted wire. The call never gets a clean value.
     Undecodable(String),
@@ -553,6 +556,7 @@ impl Engine {
                 };
                 CallResult::Err { ordinal: id, body }
             }
+            Envelope::Fault => CallResult::Fault,
         };
         self.settle(request_id, result);
     }
@@ -579,6 +583,7 @@ impl Engine {
                 }
                 framing.encode_response_err(request_id, ordinal, &body, &mut resp);
             }
+            SimOutcome::Fault => framing.encode_response_fault(request_id, &mut resp),
             SimOutcome::None => return,
         }
         self.emit(conn_id, Direction::Response, resp);
@@ -601,14 +606,13 @@ impl Engine {
                     ordinal,
                     data: body,
                 },
-                CallResult::Undecodable(msg) => SimOutcome::Err {
-                    ordinal: 0,
-                    data: json!({ "error": msg }),
-                },
-                CallResult::Timeout => SimOutcome::Err {
-                    ordinal: 0,
-                    data: json!({ "error": "forward: upstream timed out" }),
-                },
+                // The upstream gave us nothing we can relay. Before the fault
+                // channel this fabricated `ordinal: 0`, which the outer
+                // caller's client decodes as whichever error happens to hold
+                // that ordinal — a wrong answer, not a failure.
+                CallResult::Fault | CallResult::Undecodable(_) | CallResult::Timeout => {
+                    SimOutcome::Fault
+                }
             };
             self.reply_now(&cont.outer_conn, cont.outer_request_id, outcome);
         } else {
@@ -1175,6 +1179,76 @@ mod tests {
                 "{framing:?}/{codec:?} decoded body"
             );
         }
+    }
+
+    #[test]
+    fn a_provider_fault_round_trips_over_every_framing() {
+        for (framing, codec) in TRANSPORT_MATRIX {
+            let mut session = chat::session();
+            session.set_transport(chat::CONN, framing, codec);
+            let backend = session
+                .instances
+                .iter()
+                .find(|i| i.role == Role::Server)
+                .unwrap()
+                .id
+                .clone();
+            // `send` declares no error, so `Raise` does not even apply to it —
+            // a fault is the only way it can fail.
+            session
+                .set_behavior(&backend, "send", BehaviorKind::Fault, Some(json!({})))
+                .unwrap();
+
+            let mut e = Engine::new();
+            e.sync(&session);
+            let id = e.call(chat::CONN, "send", &json!(["hi"])).unwrap();
+            e.run();
+            assert_eq!(
+                e.result(id),
+                Some(&CallResult::Fault),
+                "{framing:?}/{codec:?} carried the fault"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forwarded_fault_stays_a_fault_instead_of_becoming_ordinal_zero() {
+        let mut session = chat::session();
+        let backend = session
+            .instances
+            .iter()
+            .find(|i| i.role == Role::Server)
+            .unwrap()
+            .id
+            .clone();
+        session
+            .set_behavior(&backend, "send", BehaviorKind::Fault, Some(json!({})))
+            .unwrap();
+
+        let gw_client = session.add_instance(client_instance(Role::Client), Placement::default());
+        let c_gw_backend = session.add_connection(&gw_client, &backend).unwrap();
+        let gw_server = session.add_instance(client_instance(Role::Server), Placement::default());
+        let outer_client =
+            session.add_instance(client_instance(Role::Client), Placement::default());
+        let c_outer = session.add_connection(&outer_client, &gw_server).unwrap();
+        session
+            .set_behavior(
+                &gw_server,
+                "send",
+                BehaviorKind::Forward,
+                Some(json!({ "viaConnectionId": c_gw_backend, "targetFn": "send" })),
+            )
+            .unwrap();
+
+        let mut e = Engine::new();
+        e.sync(&session);
+        let id = e.call(&c_outer, "send", &json!(["relay"])).unwrap();
+        e.run();
+
+        // The gateway has nothing to relay. It must say so as a fault — not as
+        // `ordinal: 0`, which the outer client would decode as whichever error
+        // happens to hold that ordinal.
+        assert_eq!(e.result(id), Some(&CallResult::Fault));
     }
 
     #[test]

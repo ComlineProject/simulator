@@ -38,7 +38,7 @@ src/format.rs        the JSON WireFormat
 src/shape.rs         the compiled-project projection (describe_project mirror)
 src/clock.rs         the virtual clock + its event queue
 src/wire.rs          one connection's tapped, fault-injecting channel
-src/behavior.rs      the 8 server behaviours (reply … forward, script)
+src/behavior.rs      the 9 server behaviours (reply … fault, forward, script)
 src/generic.rs       a dispatcher driven by a ProtocolShape, no codegen
 src/model.rs         the Session: nodes, instances, connections, ops
 src/session_codec.rs the Session ⇄ #s=… shareable link
