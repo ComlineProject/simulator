@@ -21,6 +21,9 @@ pub enum SimOutcome {
     Ok(Value),
     /// A raised schema error: its schema-global `ordinal` and `data` body.
     Err { ordinal: u16, data: Value },
+    /// The provider failed where the schema declares no error for it. Carries
+    /// no body: a fault is deliberately opaque on the wire.
+    Fault,
     /// One-way — nothing to send back.
     None,
 }
@@ -130,6 +133,15 @@ impl Behavior for Raise {
             ordinal: self.ordinal,
             data: self.data.clone(),
         })
+    }
+}
+
+/// "Fault (provider failed)" — the provider could not honour the call and the
+/// schema declares no error for it. The caller sees a fault, not an ordinal.
+pub struct Faulting;
+impl Behavior for Faulting {
+    fn run(&mut self, _ctx: BehaviorCtx<'_>) -> BehaviorStep {
+        BehaviorStep::Now(SimOutcome::Fault)
     }
 }
 
@@ -279,6 +291,7 @@ pub enum BehaviorKind {
     Increment,
     Delay,
     Raise,
+    Fault,
     Drop,
     Forward,
     /// A user-written Rhai script (milestone 2f). Sandboxed: no I/O, capped
@@ -287,12 +300,13 @@ pub enum BehaviorKind {
 }
 
 impl BehaviorKind {
-    pub const ALL: [BehaviorKind; 8] = [
+    pub const ALL: [BehaviorKind; 9] = [
         BehaviorKind::Reply,
         BehaviorKind::Echo,
         BehaviorKind::Increment,
         BehaviorKind::Delay,
         BehaviorKind::Raise,
+        BehaviorKind::Fault,
         BehaviorKind::Drop,
         BehaviorKind::Forward,
         BehaviorKind::Script,
@@ -305,6 +319,7 @@ impl BehaviorKind {
             BehaviorKind::Increment => "Increment field",
             BehaviorKind::Delay => "Delay then reply",
             BehaviorKind::Raise => "Raise error",
+            BehaviorKind::Fault => "Fault (provider failed)",
             BehaviorKind::Drop => "Drop (never reply)",
             BehaviorKind::Forward => "Forward to another server",
             BehaviorKind::Script => "Run a script (Rhai)",
@@ -319,6 +334,7 @@ impl BehaviorKind {
             BehaviorKind::Increment => "increment",
             BehaviorKind::Delay => "delay",
             BehaviorKind::Raise => "raise",
+            BehaviorKind::Fault => "fault",
             BehaviorKind::Drop => "drop",
             BehaviorKind::Forward => "forward",
             BehaviorKind::Script => "script",
@@ -342,7 +358,9 @@ impl BehaviorKind {
                 !function.oneway && matches!(function.returns, Some(TypeRef::Ref { .. }))
             }
             BehaviorKind::Raise => !function.throws.is_empty(),
-            BehaviorKind::Forward => !function.oneway,
+            // A fault needs a response frame to ride on, but — unlike `Raise` —
+            // not a declared error: that is the whole point of the channel.
+            BehaviorKind::Fault | BehaviorKind::Forward => !function.oneway,
         }
     }
 
@@ -356,7 +374,9 @@ impl BehaviorKind {
         };
         match self {
             BehaviorKind::Reply => serde_json::json!({ "value": zero_return() }),
-            BehaviorKind::Echo | BehaviorKind::Drop => serde_json::json!({}),
+            BehaviorKind::Echo | BehaviorKind::Fault | BehaviorKind::Drop => {
+                serde_json::json!({})
+            }
             BehaviorKind::Increment => serde_json::json!({
                 "base": zero_return(),
                 "path": first_numeric_path(function, schema).unwrap_or_default(),
@@ -416,6 +436,7 @@ impl BehaviorKind {
                 ordinal: get("ordinal").as_u64().unwrap_or(0) as u16,
                 data: get("data"),
             }),
+            BehaviorKind::Fault => Box::new(Faulting),
             BehaviorKind::Drop => Box::new(Drop),
             BehaviorKind::Forward => Box::new(Forward {
                 via: get("viaConnectionId")
@@ -634,6 +655,49 @@ mod tests {
     }
 
     #[test]
+    fn a_function_that_throws_several_errors_can_raise_any_of_them() {
+        let shape = |ordinal: u16, name: &str| crate::shape::ErrorShape {
+            ordinal,
+            name: name.into(),
+            message: name.into(),
+            fields: vec![],
+        };
+        let mut f = fn_send();
+        f.throws = vec![
+            crate::shape::ThrowShape {
+                ordinal: 5,
+                name: "TooLong".into(),
+            },
+            crate::shape::ThrowShape {
+                ordinal: 9,
+                name: "Denied".into(),
+            },
+        ];
+        let (schema, proto) = schema_with(
+            vec![f.clone()],
+            vec![],
+            vec![shape(5, "TooLong"), shape(9, "Denied")],
+        );
+
+        // the default seeds the first declared error — declaration order, not
+        // ordinal order
+        assert_eq!(
+            BehaviorKind::Raise.default_config(&f, &schema)["ordinal"],
+            json!(5)
+        );
+
+        // but the config names an ordinal, so the second one is reachable too
+        let mut raise = BehaviorKind::Raise.make(&json!({ "ordinal": 9, "data": {} }), &f, &schema);
+        assert_eq!(
+            raise.run(ctx(&proto, Value::Null)),
+            BehaviorStep::Now(SimOutcome::Err {
+                ordinal: 9,
+                data: json!({})
+            })
+        );
+    }
+
+    #[test]
     fn reply_and_echo_answer_now() {
         let (schema, proto) = schema_with(vec![fn_send()], vec![counter_type()], vec![]);
 
@@ -761,7 +825,7 @@ mod tests {
             serde_json::to_string(&BehaviorKind::Script).unwrap(),
             "\"script\""
         );
-        assert_eq!(BehaviorKind::ALL.len(), 8);
+        assert_eq!(BehaviorKind::ALL.len(), 9);
     }
 
     #[test]

@@ -79,6 +79,16 @@ impl WireFraming {
         }
     }
 
+    /// Frame a provider fault — a failure the schema declares no error for.
+    /// Each framing renders it in its own idiom: the datagram framing has a
+    /// third tag, JSON-RPC uses its reserved `-32603 Internal error`.
+    pub fn encode_response_fault(self, request_id: u64, out: &mut Vec<u8>) {
+        match self {
+            WireFraming::Datagram => DatagramFraming.encode_response_fault(request_id, out),
+            WireFraming::Jsonrpc => jsonrpc_encode_response_fault(request_id, out),
+        }
+    }
+
     pub fn decode_response<'f>(self, frame: &'f [u8]) -> Option<(u64, Envelope<'f>)> {
         match self {
             WireFraming::Datagram => DatagramFraming.decode_response(frame),
@@ -150,6 +160,12 @@ fn jsonrpc_encode_response_err(request_id: u64, id: u16, body: &[u8], out: &mut 
     out.put_slice(b"}");
 }
 
+fn jsonrpc_encode_response_fault(request_id: u64, out: &mut Vec<u8>) {
+    out.put_slice(br#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":"#);
+    out.put_slice(&u64_bytes(request_id));
+    out.put_slice(b"}");
+}
+
 fn jsonrpc_decode_response(frame: &[u8]) -> Option<(u64, Envelope<'_>)> {
     #[derive(Deserialize)]
     struct ErrIn<'a> {
@@ -167,10 +183,16 @@ fn jsonrpc_decode_response(frame: &[u8]) -> Option<(u64, Envelope<'_>)> {
     }
     let r: RespIn = serde_json::from_slice(frame).ok()?;
     if let Some(e) = r.error {
+        // Only a code inside the ordinal space is a raised schema error. The
+        // reserved negative codes are JSON-RPC's own, and a fault is one of
+        // them — `as u16` would have turned -32603 into an ordinal.
+        let Ok(id) = u16::try_from(e.code) else {
+            return Some((r.id, Envelope::Fault));
+        };
         Some((
             r.id,
             Envelope::Err {
-                id: e.code as u16,
+                id,
                 body: e.data.map(|d| d.get().as_bytes()).unwrap_or(b"null"),
             },
         ))
@@ -226,6 +248,39 @@ mod tests {
                     body: br#"{"why":"no"}"#
                 }
             ))
+        );
+    }
+
+    #[test]
+    fn a_fault_round_trips_over_both_framings() {
+        for f in [WireFraming::Datagram, WireFraming::Jsonrpc] {
+            let mut frame = Vec::new();
+            f.encode_response_fault(9, &mut frame);
+            assert_eq!(
+                f.decode_response(&frame),
+                Some((9, Envelope::Fault)),
+                "{f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jsonrpc_renders_a_fault_as_its_own_internal_error() {
+        let mut frame = Vec::new();
+        WireFraming::Jsonrpc.encode_response_fault(4, &mut frame);
+        assert_eq!(
+            std::str::from_utf8(&frame).unwrap(),
+            r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":4}"#
+        );
+    }
+
+    #[test]
+    fn a_reserved_jsonrpc_code_is_not_mistaken_for_an_ordinal() {
+        // -32601 is "method not found", not error ordinal 33039 (`-32601 as u16`).
+        let frame = br#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"nope"},"id":1}"#;
+        assert_eq!(
+            WireFraming::Jsonrpc.decode_response(frame),
+            Some((1, Envelope::Fault))
         );
     }
 
