@@ -568,6 +568,7 @@ impl Engine {
         };
         let (framing, codec) = (wire.framing, wire.codec);
         let mut resp = Vec::new();
+        let mut note = None;
         match outcome {
             SimOutcome::Ok(value) => {
                 let mut body = Vec::new();
@@ -583,10 +584,25 @@ impl Engine {
                 }
                 framing.encode_response_err(request_id, ordinal, &body, &mut resp);
             }
-            SimOutcome::Fault => framing.encode_response_fault(request_id, &mut resp),
+            SimOutcome::Fault { note: why } => {
+                framing.encode_response_fault(request_id, &mut resp);
+                note = why;
+            }
             SimOutcome::None => return,
         }
         self.emit(conn_id, Direction::Response, resp);
+        // The wire carries no reason for a fault; the provider's log does.
+        // `emit` records exactly one frame per call, so the reason belongs on
+        // the last one.
+        if let Some(note) = note {
+            if let Some(frame) = self
+                .wires
+                .get_mut(conn_id)
+                .and_then(|w| w.channel.tap.frames.last_mut())
+            {
+                frame.note = Some(note);
+            }
+        }
     }
 
     /// Settle a call — either resume the forward waiting on it, or record it.
@@ -610,8 +626,13 @@ impl Engine {
                 // channel this fabricated `ordinal: 0`, which the outer
                 // caller's client decodes as whichever error happens to hold
                 // that ordinal — a wrong answer, not a failure.
-                CallResult::Fault | CallResult::Undecodable(_) | CallResult::Timeout => {
-                    SimOutcome::Fault
+                CallResult::Fault => SimOutcome::fault(format!("forward: {} faulted", cont.via)),
+                CallResult::Undecodable(why) => SimOutcome::fault(format!(
+                    "forward: {}'s reply did not decode ({why})",
+                    cont.via
+                )),
+                CallResult::Timeout => {
+                    SimOutcome::fault(format!("forward: {} timed out", cont.via))
                 }
             };
             self.reply_now(&cont.outer_conn, cont.outer_request_id, outcome);
@@ -652,14 +673,7 @@ impl Engine {
             _ => None,
         };
         if let Some(message) = refusal {
-            self.reply_now(
-                outer_conn,
-                outer_request_id,
-                SimOutcome::Err {
-                    ordinal: 0,
-                    data: json!({ "error": message }),
-                },
-            );
+            self.reply_now(outer_conn, outer_request_id, SimOutcome::fault(message));
             return;
         }
 
@@ -680,10 +694,7 @@ impl Engine {
                 self.reply_now(
                     outer_conn,
                     outer_request_id,
-                    SimOutcome::Err {
-                        ordinal: 0,
-                        data: json!({ "error": format!("forward: {via} has no {target_fn}") }),
-                    },
+                    SimOutcome::fault(format!("forward: {via} has no {target_fn}")),
                 );
             }
         }
@@ -1025,12 +1036,24 @@ mod tests {
         let id = e.call(&c_in, "send", &json!(["loop"])).unwrap();
         e.run();
 
-        match e.result(id) {
-            Some(CallResult::Err { ordinal: 0, body }) => {
-                assert!(body["error"].as_str().unwrap().contains("cycle"), "{body}");
-            }
-            other => panic!("expected a cycle error, got {other:?}"),
-        }
+        // The caller sees a fault — not `ordinal: 0`, which its client would
+        // have decoded as whichever declared error happened to hold it.
+        assert_eq!(e.result(id), Some(&CallResult::Fault));
+
+        // The reason is not on the wire, but it is on the frames. The refusal
+        // happens at the innermost hop; each outer hop relays it as a fault of
+        // its own, naming the connection that failed it.
+        let notes = |conn: &str| -> Vec<String> {
+            e.tap(conn)
+                .unwrap()
+                .frames
+                .iter()
+                .filter_map(|f| f.note.clone())
+                .collect()
+        };
+        assert_eq!(notes(&c2_to_g1), ["forwarding cycle"]);
+        assert_eq!(notes(&c1_to_g2), [format!("forward: {c2_to_g1} faulted")]);
+        assert_eq!(notes(&c_in), [format!("forward: {c1_to_g2} faulted")]);
     }
 
     #[test]

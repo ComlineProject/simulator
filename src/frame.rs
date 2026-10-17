@@ -36,6 +36,11 @@ pub struct Frame {
     /// What the wire's fault spec did to this frame, if anything.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fault: Option<String>,
+    /// Why the provider faulted, when this frame is a fault response. Not on
+    /// the wire — a fault is opaque by design — but the simulator is both
+    /// ends, so it can show what a real provider would only have logged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Best-effort label for the log. The handshake frame is unambiguous (fixed
@@ -99,6 +104,7 @@ impl Tap {
             at,
             kind,
             fault,
+            note: None,
         });
         self.counter
     }

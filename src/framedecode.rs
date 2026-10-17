@@ -35,6 +35,11 @@ pub struct FrameDetail {
     /// response: the provider faulted. No ordinal and no body to show.
     #[serde(skip_serializing_if = "core::ops::Not::not")]
     pub fault: bool,
+    /// response: why the provider faulted, when the simulator knows. Not
+    /// decoded from the bytes — a fault carries no reason on the wire — but
+    /// read off the recorded frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// handshake: the fields it carries (names resolved where known).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handshake: Option<HandshakeDetail>,
@@ -76,6 +81,7 @@ impl FrameDetail {
             ok: None,
             err: None,
             fault: false,
+            note: None,
             handshake: None,
         }
     }
@@ -185,7 +191,10 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
                 d.framing = "undecodable".into();
             }
         }
-        Envelope::Fault => d.fault = true,
+        Envelope::Fault => {
+            d.fault = true;
+            d.note = frame.note.clone();
+        }
     }
     d
 }
@@ -299,6 +308,33 @@ mod tests {
         assert!(res.ok.is_none());
         // and it is not reported as a broken frame
         assert_ne!(res.framing, "undecodable");
+    }
+
+    #[test]
+    fn a_fault_frame_shows_why_the_provider_faulted() {
+        let mut session = chat::session();
+        session
+            .set_behavior(
+                &session
+                    .instances
+                    .iter()
+                    .find(|i| i.role == crate::model::Role::Server)
+                    .unwrap()
+                    .id
+                    .clone(),
+                "send",
+                crate::behavior::BehaviorKind::Forward,
+                Some(json!({ "viaConnectionId": "", "targetFn": "send" })),
+            )
+            .unwrap();
+        let mut e = Engine::new();
+        e.sync(&session);
+        e.call(chat::CONN, "send", &json!(["hi"])).unwrap();
+        e.run();
+
+        let res = detail(&e, chat::CONN, 4);
+        assert!(res.fault);
+        assert_eq!(res.note.as_deref(), Some("forward: pick a connection"));
     }
 
     #[test]
