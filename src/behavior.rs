@@ -21,9 +21,12 @@ pub enum SimOutcome {
     Ok(Value),
     /// A raised schema error: its schema-global `ordinal` and `data` body.
     Err { ordinal: u16, data: Value },
-    /// The provider failed where the schema declares no error for it. Carries
-    /// no body: a fault is deliberately opaque on the wire.
-    Fault,
+    /// The provider failed where the schema declares no error for it. A fault
+    /// is opaque on the wire — no ordinal, no body — so `note`, the
+    /// simulator's own account of *why*, never leaves the engine: it is pinned
+    /// to the response frame for the inspector, the way a real provider would
+    /// log it server-side.
+    Fault { note: Option<String> },
     /// One-way — nothing to send back.
     None,
 }
@@ -65,6 +68,17 @@ fn ok_or_none(function: &FnShape, value: Value) -> SimOutcome {
         SimOutcome::None
     } else {
         SimOutcome::Ok(value)
+    }
+}
+
+/// A fault for a normal function, `None` for a one-way one. A one-way call has
+/// no response frame, so it cannot carry a fault: sending one anyway would put
+/// a reply on the wire that no caller is waiting for.
+fn fault_or_none(function: &FnShape, note: Option<String>) -> SimOutcome {
+    if function.oneway {
+        SimOutcome::None
+    } else {
+        SimOutcome::Fault { note }
     }
 }
 
@@ -140,8 +154,17 @@ impl Behavior for Raise {
 /// schema declares no error for it. The caller sees a fault, not an ordinal.
 pub struct Faulting;
 impl Behavior for Faulting {
-    fn run(&mut self, _ctx: BehaviorCtx<'_>) -> BehaviorStep {
-        BehaviorStep::Now(SimOutcome::Fault)
+    fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep {
+        BehaviorStep::Now(fault_or_none(ctx.function, None))
+    }
+}
+
+impl SimOutcome {
+    /// A fault, with the simulator's reason for it.
+    pub fn fault(note: impl Into<String>) -> Self {
+        SimOutcome::Fault {
+            note: Some(note.into()),
+        }
     }
 }
 
@@ -161,10 +184,7 @@ pub struct Forward {
 impl Behavior for Forward {
     fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep {
         if self.via.is_empty() {
-            return BehaviorStep::Now(SimOutcome::Err {
-                ordinal: 0,
-                data: serde_json::json!({ "error": "forward: pick a connection" }),
-            });
+            return BehaviorStep::Now(SimOutcome::fault("forward: pick a connection"));
         }
         BehaviorStep::Forward {
             via: self.via.clone(),
@@ -180,10 +200,11 @@ impl Behavior for Forward {
 
 /// "Run a script (Rhai)" — a user-written handler. `params` (the decoded
 /// request) and a persistent `state` map are in scope; the last expression is
-/// the reply, `throw` raises an error.
+/// the reply. `throw`, a runtime error or a script that does not compile all
+/// fault the call, with the error as the frame's note.
 #[cfg(feature = "script")]
 mod script {
-    use super::{ok_or_none, Behavior, BehaviorCtx, BehaviorStep, SimOutcome};
+    use super::{fault_or_none, ok_or_none, Behavior, BehaviorCtx, BehaviorStep, FnShape};
     use serde_json::Value;
 
     thread_local! {
@@ -226,7 +247,7 @@ mod script {
     impl Behavior for Script {
         fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep {
             let Some(ast) = &self.ast else {
-                return err(self.error.clone().unwrap_or_default());
+                return err(ctx.function, self.error.clone().unwrap_or_default());
             };
             ENGINE.with(|engine| {
                 let mut scope = rhai::Scope::new();
@@ -244,17 +265,18 @@ mod script {
                             rhai::serde::from_dynamic::<Value>(&value).unwrap_or(Value::Null);
                         BehaviorStep::Now(ok_or_none(ctx.function, value))
                     }
-                    Err(e) => err(e.to_string()),
+                    Err(e) => err(ctx.function, e.to_string()),
                 }
             })
         }
     }
 
-    fn err(message: String) -> BehaviorStep {
-        BehaviorStep::Now(SimOutcome::Err {
-            ordinal: 0,
-            data: serde_json::json!({ "error": message }),
-        })
+    /// A script that failed. This used to answer `ordinal: 0` with the message
+    /// as the body — a *schema* error the caller decodes as whichever error
+    /// happens to hold ordinal 0. The script never declared that error; it
+    /// failed. So it faults.
+    fn err(function: &FnShape, message: String) -> BehaviorStep {
+        BehaviorStep::Now(fault_or_none(function, Some(message)))
     }
 }
 
@@ -262,7 +284,7 @@ mod script {
 /// it isn't available.
 #[cfg(not(feature = "script"))]
 mod script {
-    use super::{Behavior, BehaviorCtx, BehaviorStep, SimOutcome};
+    use super::{fault_or_none, Behavior, BehaviorCtx, BehaviorStep};
 
     struct Disabled;
 
@@ -271,11 +293,11 @@ mod script {
     }
 
     impl Behavior for Disabled {
-        fn run(&mut self, _ctx: BehaviorCtx<'_>) -> BehaviorStep {
-            BehaviorStep::Now(SimOutcome::Err {
-                ordinal: 0,
-                data: serde_json::json!({ "error": "scripting is not enabled in this build" }),
-            })
+        fn run(&mut self, ctx: BehaviorCtx<'_>) -> BehaviorStep {
+            BehaviorStep::Now(fault_or_none(
+                ctx.function,
+                Some("scripting is not enabled in this build".into()),
+            ))
         }
     }
 }
@@ -794,10 +816,10 @@ mod tests {
             &proto.functions[0],
             &schema,
         );
-        assert!(matches!(
+        assert_eq!(
             no_conn.run(ctx(&proto, Value::Null)),
-            BehaviorStep::Now(SimOutcome::Err { ordinal: 0, .. })
-        ));
+            BehaviorStep::Now(SimOutcome::fault("forward: pick a connection"))
+        );
 
         let mut fwd = BehaviorKind::Forward.make(
             &json!({ "viaConnectionId": "c2", "targetFn": "" }),
@@ -891,36 +913,33 @@ mod tests {
         }
 
         #[test]
-        fn a_thrown_value_becomes_an_error() {
+        fn a_thrown_value_faults_the_call() {
             match run_script(r#"throw "boom""#, Value::Null) {
-                BehaviorStep::Now(SimOutcome::Err { ordinal: 0, data }) => {
-                    assert!(data["error"].as_str().unwrap().contains("boom"), "{data}");
+                BehaviorStep::Now(SimOutcome::Fault { note: Some(note) }) => {
+                    assert!(note.contains("boom"), "{note}");
                 }
-                other => panic!("expected an error, got {other:?}"),
+                other => panic!("expected a fault, got {other:?}"),
             }
         }
 
         #[test]
-        fn a_script_that_does_not_compile_errors_at_run() {
+        fn a_script_that_does_not_compile_faults_at_run() {
             match run_script("this is ( not rhai", Value::Null) {
-                BehaviorStep::Now(SimOutcome::Err { data, .. }) => {
-                    assert!(
-                        data["error"].as_str().unwrap().contains("compile"),
-                        "{data}"
-                    );
+                BehaviorStep::Now(SimOutcome::Fault { note: Some(note) }) => {
+                    assert!(note.contains("compile"), "{note}");
                 }
-                other => panic!("expected a compile error, got {other:?}"),
+                other => panic!("expected a compile fault, got {other:?}"),
             }
         }
 
         #[test]
         fn an_infinite_loop_is_stopped_not_hung() {
             match run_script("let i = 0; while true { i += 1; } i", Value::Null) {
-                BehaviorStep::Now(SimOutcome::Err { data, .. }) => {
-                    let msg = data["error"].as_str().unwrap().to_lowercase();
-                    assert!(msg.contains("operation") || msg.contains("limit"), "{data}");
+                BehaviorStep::Now(SimOutcome::Fault { note: Some(note) }) => {
+                    let msg = note.to_lowercase();
+                    assert!(msg.contains("operation") || msg.contains("limit"), "{note}");
                 }
-                other => panic!("expected a limit error, got {other:?}"),
+                other => panic!("expected a limit fault, got {other:?}"),
             }
         }
 
@@ -932,6 +951,25 @@ mod tests {
             let (schema, proto) = schema_with(vec![f], vec![], vec![]);
             let mut b = BehaviorKind::Script.make(
                 &json!({ "source": "params" }),
+                &proto.functions[0],
+                &schema,
+            );
+            assert_eq!(
+                b.run(ctx(&proto, json!(["x"]))),
+                BehaviorStep::Now(SimOutcome::None)
+            );
+        }
+
+        #[test]
+        fn a_failing_one_way_script_still_sends_nothing() {
+            // There is no response frame for a fault to ride on: answering
+            // anyway would put a reply on the wire no caller is waiting for.
+            let mut f = fn_send();
+            f.oneway = true;
+            f.returns = None;
+            let (schema, proto) = schema_with(vec![f], vec![], vec![]);
+            let mut b = BehaviorKind::Script.make(
+                &json!({ "source": r#"throw "boom""# }),
                 &proto.functions[0],
                 &schema,
             );
