@@ -108,7 +108,12 @@ impl TypeDef {
 pub enum TypeRef {
     Prim { name: String },
     Ref { name: String },
-    Array { of: Box<TypeRef> },
+    /// `len` is a fixed array's length (`u8[4]`); absent for `T[]`.
+    Array {
+        of: Box<TypeRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        len: Option<u64>,
+    },
     Unit,
     Union { of: Vec<TypeRef> },
 }
@@ -131,7 +136,8 @@ pub fn type_label(ty: &TypeRef) -> String {
     match ty {
         TypeRef::Unit => "()".to_string(),
         TypeRef::Prim { name } | TypeRef::Ref { name } => name.clone(),
-        TypeRef::Array { of } => format!("{}[]", type_label(of)),
+        TypeRef::Array { of, len: None } => format!("{}[]", type_label(of)),
+        TypeRef::Array { of, len: Some(n) } => format!("{}[{n}]", type_label(of)),
         TypeRef::Union { of } => of.iter().map(type_label).collect::<Vec<_>>().join(" | "),
     }
 }
@@ -145,7 +151,10 @@ pub fn zero_value(ty: &TypeRef, types: &[TypeDef]) -> Value {
 fn zero_value_seen(ty: &TypeRef, types: &[TypeDef], seen: &mut Vec<String>) -> Value {
     match ty {
         TypeRef::Unit => Value::Null,
-        TypeRef::Array { .. } => Value::Array(Vec::new()),
+        TypeRef::Array { len: None, .. } => Value::Array(Vec::new()),
+        TypeRef::Array { of, len: Some(n) } => {
+            Value::Array((0..*n).map(|_| zero_value_seen(of, types, seen)).collect())
+        }
         TypeRef::Union { of } => of
             .first()
             .map_or(Value::Null, |t| zero_value_seen(t, types, seen)),
@@ -272,7 +281,8 @@ mod tests {
             TypeRef::Array {
                 of: Box::new(TypeRef::Ref {
                     name: "Message".into()
-                })
+                }),
+                len: None
             }
         );
         assert_eq!(
@@ -328,11 +338,23 @@ mod tests {
         assert_eq!(
             zero_value(
                 &TypeRef::Array {
-                    of: Box::new(TypeRef::Unit)
+                    of: Box::new(TypeRef::Unit),
+                    len: None
                 },
                 &types
             ),
             json!([])
+        );
+        // A fixed array is already its full length.
+        assert_eq!(
+            zero_value(
+                &TypeRef::Array {
+                    of: Box::new(TypeRef::Prim { name: "u8".into() }),
+                    len: Some(3)
+                },
+                &types
+            ),
+            json!([0, 0, 0])
         );
         assert_eq!(
             zero_value(
@@ -384,7 +406,8 @@ mod tests {
             type_label(&TypeRef::Array {
                 of: Box::new(TypeRef::Ref {
                     name: "Message".into()
-                })
+                }),
+                len: None
             }),
             "Message[]"
         );
