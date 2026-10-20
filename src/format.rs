@@ -6,7 +6,7 @@
 //! [`Codec`] is the enum the engine holds so a connection can pick a format; it
 //! implements [`WireFormat`] by dispatch.
 
-use comline_runtime::contract::{BufMut, RuntimeError, WireFormat};
+use comline_runtime::contract::{BufMut, RuntimeError, WireFormat, FORMAT_JSON, FORMAT_MSGPACK};
 use serde::{Deserialize, Serialize};
 
 /// JSON via `serde_json`, appended straight into the frame buffer.
@@ -14,7 +14,7 @@ pub struct Json;
 
 impl WireFormat for Json {
     fn name(&self) -> &'static str {
-        "json"
+        FORMAT_JSON
     }
 
     fn encode<T: Serialize + ?Sized>(
@@ -38,7 +38,7 @@ pub struct MsgPack;
 
 impl WireFormat for MsgPack {
     fn name(&self) -> &'static str {
-        "msgpack"
+        FORMAT_MSGPACK
     }
 
     fn encode<T: Serialize + ?Sized>(
@@ -67,6 +67,16 @@ pub enum Codec {
 }
 
 impl Codec {
+    /// The short key a session link and the UI use (`json`, `msgpack`), the
+    /// same spelling [`Codec::parse`] reads. The handshake uses the versioned
+    /// [`WireFormat::name`] instead.
+    pub fn label(self) -> &'static str {
+        match self {
+            Codec::Json => "json",
+            Codec::Msgpack => "msgpack",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "json" => Some(Codec::Json),
@@ -79,8 +89,8 @@ impl Codec {
 impl WireFormat for Codec {
     fn name(&self) -> &'static str {
         match self {
-            Codec::Json => "json",
-            Codec::Msgpack => "msgpack",
+            Codec::Json => FORMAT_JSON,
+            Codec::Msgpack => FORMAT_MSGPACK,
         }
     }
 
@@ -136,7 +146,7 @@ mod tests {
         for c in [Codec::Json, Codec::Msgpack] {
             let s = serde_json::to_string(&c).unwrap();
             assert_eq!(serde_json::from_str::<Codec>(&s).unwrap(), c);
-            assert_eq!(Codec::parse(c.name()), Some(c));
+            assert_eq!(Codec::parse(c.label()), Some(c));
         }
     }
 }

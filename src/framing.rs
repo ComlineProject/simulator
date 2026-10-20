@@ -27,7 +27,7 @@ impl WireFraming {
     pub fn name(self) -> &'static str {
         match self {
             WireFraming::Datagram => comline_runtime::contract::FRAMING_DATAGRAM,
-            WireFraming::Jsonrpc => "jsonrpc-2.0",
+            WireFraming::Jsonrpc => comline_runtime::contract::FRAMING_JSONRPC,
         }
     }
 

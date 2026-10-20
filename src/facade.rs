@@ -680,7 +680,7 @@ mod tests {
         );
         // the request frame is now a json-rpc text frame
         let req: Value = serde_json::from_str(&s.describe_frame(chat::CONN, 3).unwrap()).unwrap();
-        assert_eq!(req["framing"], "jsonrpc-2.0");
+        assert_eq!(req["framing"], comline_runtime::contract::FRAMING_JSONRPC);
 
         // the parse succeeds but the combo is invalid → the connection is refused
         s.set_transport(chat::CONN, "jsonrpc", "msgpack")
