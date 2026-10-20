@@ -90,8 +90,8 @@ impl FrameDetail {
 /// FNV-1a hash → readable name, for the handshake's wire-format / framing.
 fn name_of(hash: u64) -> String {
     for name in [
-        "json",
-        "msgpack",
+        comline_runtime::contract::FORMAT_JSON,
+        comline_runtime::contract::FORMAT_MSGPACK,
         WireFraming::Datagram.name(),
         WireFraming::Jsonrpc.name(),
     ] {
@@ -246,7 +246,7 @@ mod tests {
         let hs = detail(&e, chat::CONN, 1);
         assert_eq!(hs.kind, "handshake");
         let h = hs.handshake.unwrap();
-        assert_eq!(h.wire_format, "json");
+        assert_eq!(h.wire_format, comline_runtime::contract::FORMAT_JSON);
         assert_eq!(h.framing, WireFraming::Datagram.name());
         assert_eq!(h.ir_hash, "0x9f2b1c7d4e6a8035"); // the `chat` fixture's placeholder hash
 

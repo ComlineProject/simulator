@@ -752,7 +752,7 @@ pub fn compare_transports(
             let id = engine.call(conn_id, fn_name, params).ok();
             engine.run();
             MatrixRun {
-                label: format!("{}/{}", framing_label(framing), codec.name()),
+                label: format!("{}/{}", framing_label(framing), codec.label()),
                 frames: engine
                     .tap(conn_id)
                     .map(|t| t.frames.clone())
