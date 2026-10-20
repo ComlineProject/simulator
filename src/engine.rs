@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use comline_runtime::contract::{Envelope, Handshake, RuntimeError, WireFormat};
+use comline_runtime::contract::{Envelope, HandshakeFrame, RuntimeError, WireFormat};
 use serde_json::{json, Value};
 
 use crate::behavior::{BehaviorKind, BehaviorStep, SimOutcome};
@@ -778,7 +778,7 @@ fn handshake_frame(ir_hash: &str, wire_format: &str, framing: &str) -> Vec<u8> {
         .and_then(|h| u64::from_str_radix(h, 16).ok())
         .unwrap_or(0);
     let mut buf = Vec::new();
-    Handshake::new(hash, wire_format, framing, 0).encode(&mut buf);
+    HandshakeFrame::new(hash, wire_format, framing, 0).encode(&mut buf);
     buf
 }
 

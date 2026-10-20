@@ -2,7 +2,7 @@
 //! framing / handshake decoders the engine uses, plus a decode of the sub-frame
 //! body with the connection's wire format. Ported from `framedecode.ts`.
 
-use comline_runtime::contract::{name_hash, Envelope, Handshake, RequestCall, WireFormat};
+use comline_runtime::contract::{name_hash, Envelope, HandshakeFrame, RequestCall, WireFormat};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -132,7 +132,7 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
 
     // Handshake — unambiguous: fixed length + `CO` magic.
     if bytes.len() == 31 {
-        if let Some(hs) = Handshake::decode(bytes) {
+        if let Some(hs) = HandshakeFrame::decode(bytes) {
             let mut d = FrameDetail::bare("handshake", ctx.framing.name().to_string());
             d.handshake = Some(HandshakeDetail {
                 ir_hash: format!("{:#018x}", hs.ir_hash),
