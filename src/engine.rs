@@ -27,7 +27,9 @@ use crate::framing::WireFraming;
 use crate::generic::{BehaviorMap, GenericDispatch};
 use crate::model::{Connection, FramingChoice, Instance, Session};
 use crate::rng::Mulberry32;
-use crate::shape::{find_protocol, Framing as ShapeFraming, ProtocolShape, SchemaShape};
+use crate::shape::{
+    find_protocol, protocol_number, Framing as ShapeFraming, ProtocolShape, SchemaShape,
+};
 use crate::wire::{Channel, SendOutcome, REORDER_FLUSH_MS};
 
 /// What a settled call produced.
@@ -208,12 +210,17 @@ impl Engine {
         // Framing: the connection's choice, else the protocol's. Codec: the
         // connection's. JSON-RPC is a JSON text envelope — it can't carry a
         // MessagePack body, so that pair is refused.
+        // A datagram@2 frame names its protocol by its number on the
+        // connection: its position among every protocol in the package.
+        let number = protocol_number(&session.shape, &server.schema_ns, &server.protocol);
         let framing = match conn.framing {
             FramingChoice::Auto => match proto.framing {
                 ShapeFraming::Jsonrpc => WireFraming::Jsonrpc,
                 ShapeFraming::Datagram => WireFraming::Datagram,
+                ShapeFraming::Datagram2 => WireFraming::Datagram2(number),
             },
             FramingChoice::Datagram => WireFraming::Datagram,
+            FramingChoice::Datagram2 => WireFraming::Datagram2(number),
             FramingChoice::Jsonrpc => WireFraming::Jsonrpc,
         };
         let codec = conn.wire_format;
@@ -720,7 +727,9 @@ fn build_behaviors(server: &Instance, proto: &ProtocolShape, schema: &SchemaShap
 
 /// The framing / codec combinations the compare panel runs (2g). JSON-RPC pairs
 /// only with JSON.
-pub const TRANSPORT_MATRIX: [(FramingChoice, Codec); 3] = [
+pub const TRANSPORT_MATRIX: [(FramingChoice, Codec); 5] = [
+    (FramingChoice::Datagram2, Codec::Json),
+    (FramingChoice::Datagram2, Codec::Msgpack),
     (FramingChoice::Datagram, Codec::Json),
     (FramingChoice::Datagram, Codec::Msgpack),
     (FramingChoice::Jsonrpc, Codec::Json),
@@ -766,6 +775,7 @@ pub fn compare_transports(
 fn framing_label(f: FramingChoice) -> &'static str {
     match f {
         FramingChoice::Jsonrpc => "jsonrpc",
+        FramingChoice::Datagram2 => "datagram@2",
         _ => "datagram",
     }
 }
@@ -1290,7 +1300,7 @@ mod tests {
     fn compare_transports_agrees_on_the_body_and_differs_on_the_frames() {
         let session = chat::session();
         let runs = compare_transports(&session, chat::CONN, "send", &json!(["hi"]));
-        assert_eq!(runs.len(), 3);
+        assert_eq!(runs.len(), 5);
 
         // every combo decodes to the same reply
         for run in &runs {
@@ -1318,7 +1328,12 @@ mod tests {
         let dg_json = req_bytes("datagram/json");
         let dg_mp = req_bytes("datagram/msgpack");
         let rpc = req_bytes("jsonrpc/json");
+        let dg2_json = req_bytes("datagram@2/json");
         assert!(dg_mp.len() < dg_json.len(), "msgpack is tighter");
+        // datagram@2 adds the kind byte and the protocol number, then the same
+        // call frame.
+        assert_eq!(dg2_json.len(), dg_json.len() + 2);
+        assert_eq!(&dg2_json[2..], &dg_json[..]);
         assert!(std::str::from_utf8(&rpc)
             .unwrap()
             .contains("\"method\":\"send\""));

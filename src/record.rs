@@ -456,8 +456,8 @@ mod tests {
             .iter()
             .filter(|f| f.kind == crate::frame::FrameKind::Response)
             .map(|f| {
-                // datagram response: [request_id u64][tag u8][json body]
-                serde_json::from_slice(&f.bytes[9..]).unwrap()
+                // datagram@2 reply: [kind 1][protocol 0][request_id u64][tag u8][json body]
+                serde_json::from_slice(&f.bytes[11..]).unwrap()
             })
             .collect();
         assert_eq!(

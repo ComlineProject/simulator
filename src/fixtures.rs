@@ -67,7 +67,7 @@ pub fn shape_with(functions: Vec<FnShape>, ir_hash: &str) -> ProjectShape {
             ir_hash: ir_hash.into(),
             protocols: vec![ProtocolShape {
                 name: "Chat".into(),
-                framing: Framing::Datagram,
+                framing: Framing::Datagram2,
                 functions,
             }],
             errors: vec![],

@@ -32,6 +32,9 @@ pub struct SchemaShape {
 #[serde(rename_all = "lowercase")]
 pub enum Framing {
     Datagram,
+    /// The default: a connection, where either end can call.
+    #[serde(rename = "datagram@2")]
+    Datagram2,
     Jsonrpc,
 }
 
@@ -106,8 +109,12 @@ impl TypeDef {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TypeRef {
-    Prim { name: String },
-    Ref { name: String },
+    Prim {
+        name: String,
+    },
+    Ref {
+        name: String,
+    },
     /// `len` is a fixed array's length (`u8[4]`); absent for `T[]`.
     Array {
         of: Box<TypeRef>,
@@ -115,7 +122,9 @@ pub enum TypeRef {
         len: Option<u64>,
     },
     Unit,
-    Union { of: Vec<TypeRef> },
+    Union {
+        of: Vec<TypeRef>,
+    },
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────
@@ -129,6 +138,23 @@ pub fn find_protocol<'a>(
     let schema = shape.schemas.iter().find(|s| s.namespace == ns)?;
     let protocol = schema.protocols.iter().find(|p| p.name == name)?;
     Some((schema, protocol))
+}
+
+/// The number protocol `name` of schema `ns` carries on a datagram@2
+/// connection: its position among every protocol in the project, schemas in
+/// order, as the generators number it. 0 for one that isn't there.
+pub fn protocol_number(shape: &ProjectShape, ns: &str, name: &str) -> u16 {
+    shape
+        .schemas
+        .iter()
+        .flat_map(|s| {
+            s.protocols
+                .iter()
+                .map(move |p| (s.namespace.as_str(), p.name.as_str()))
+        })
+        .position(|found| found == (ns, name))
+        .and_then(|i| u16::try_from(i).ok())
+        .unwrap_or(0)
 }
 
 /// A short label for a `TypeRef` (`u64`, `Message[]`, `A | B`, `()`).
@@ -236,7 +262,7 @@ mod tests {
         let (schema, proto) = find_protocol(&shape, "chat", "Chat").unwrap();
 
         assert!(schema.ir_hash.starts_with("0x"));
-        assert_eq!(proto.framing, Framing::Datagram);
+        assert_eq!(proto.framing, Framing::Datagram2);
         assert_eq!(proto.functions.len(), 1);
 
         let send = &proto.functions[0];
@@ -420,5 +446,29 @@ mod tests {
             }),
             "A | B"
         );
+    }
+
+    #[test]
+    fn protocols_are_numbered_across_the_whole_project() {
+        let protocol = |name: &str| ProtocolShape {
+            name: name.into(),
+            framing: Framing::Datagram2,
+            functions: vec![],
+        };
+        let schema = |namespace: &str, protocols: Vec<ProtocolShape>| SchemaShape {
+            namespace: namespace.into(),
+            ir_hash: "0x0".into(),
+            protocols,
+            errors: vec![],
+            types: vec![],
+        };
+        let shape = ProjectShape {
+            schemas: vec![
+                schema("game", vec![protocol("Account"), protocol("Player")]),
+                schema("items", vec![protocol("Inventory")]),
+            ],
+        };
+        assert_eq!(protocol_number(&shape, "game", "Player"), 1);
+        assert_eq!(protocol_number(&shape, "items", "Inventory"), 2);
     }
 }

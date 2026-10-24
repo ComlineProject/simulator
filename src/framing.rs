@@ -1,5 +1,5 @@
-//! The framings a connection can speak. `DatagramFraming` comes from
-//! `comline-runtime`; JSON-RPC 2.0 is vendored here — it is the same code the
+//! The framings a connection can speak. `DatagramFraming` and
+//! `Datagram2Framing` come from `comline-runtime`; JSON-RPC 2.0 is vendored here — it is the same code the
 //! runtime ships, but the runtime keeps it behind `std` (module organisation,
 //! not a real `std` need), and `std` won't build for `wasm32`.
 //!
@@ -12,14 +12,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use comline_runtime::contract::{
-    BufMut, Call, DatagramFraming, Envelope, Framing, Request, RequestCall, RuntimeError,
-    WireFormat,
+    BufMut, Call, ConnectionFraming, Datagram2Framing, DatagramFraming, Envelope, Frame, Framing,
+    ProtocolNumber, Request, RequestCall, RuntimeError, WireFormat,
 };
 
 /// How a connection frames its calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireFraming {
     Datagram,
+    /// `datagram@2`, the default: every frame carries its kind and the
+    /// protocol's number on the connection.
+    Datagram2(ProtocolNumber),
     Jsonrpc,
 }
 
@@ -27,6 +30,7 @@ impl WireFraming {
     pub fn name(self) -> &'static str {
         match self {
             WireFraming::Datagram => comline_runtime::contract::FRAMING_DATAGRAM,
+            WireFraming::Datagram2(_) => comline_runtime::contract::FRAMING_DATAGRAM2,
             WireFraming::Jsonrpc => comline_runtime::contract::FRAMING_JSONRPC,
         }
     }
@@ -54,6 +58,15 @@ impl WireFraming {
             WireFraming::Datagram => {
                 DatagramFraming.encode_request(Call::new(call_id, ""), request_id, params, fmt, out)
             }
+            WireFraming::Datagram2(protocol) => Datagram2Framing.encode_request(
+                protocol,
+                Call::new(call_id, ""),
+                request_id,
+                false,
+                params,
+                fmt,
+                out,
+            ),
             WireFraming::Jsonrpc => jsonrpc_encode_request(call_name, request_id, params, fmt, out),
         }
     }
@@ -61,6 +74,10 @@ impl WireFraming {
     pub fn decode_request<'f>(self, frame: &'f [u8]) -> Option<Request<'f>> {
         match self {
             WireFraming::Datagram => DatagramFraming.decode_request(frame),
+            WireFraming::Datagram2(_) => match Datagram2Framing.decode(frame)? {
+                Frame::Request { request, .. } => Some(request),
+                Frame::Reply { .. } => None,
+            },
             WireFraming::Jsonrpc => jsonrpc_decode_request(frame),
         }
     }
@@ -68,6 +85,9 @@ impl WireFraming {
     pub fn encode_response_ok(self, request_id: u64, payload: &[u8], out: &mut Vec<u8>) {
         match self {
             WireFraming::Datagram => DatagramFraming.encode_response_ok(request_id, payload, out),
+            WireFraming::Datagram2(protocol) => {
+                Datagram2Framing.encode_reply(protocol, request_id, &Envelope::Ok(payload), out)
+            }
             WireFraming::Jsonrpc => jsonrpc_encode_response_ok(request_id, payload, out),
         }
     }
@@ -75,6 +95,12 @@ impl WireFraming {
     pub fn encode_response_err(self, request_id: u64, id: u16, body: &[u8], out: &mut Vec<u8>) {
         match self {
             WireFraming::Datagram => DatagramFraming.encode_response_err(request_id, id, body, out),
+            WireFraming::Datagram2(protocol) => Datagram2Framing.encode_reply(
+                protocol,
+                request_id,
+                &Envelope::Err { id, body },
+                out,
+            ),
             WireFraming::Jsonrpc => jsonrpc_encode_response_err(request_id, id, body, out),
         }
     }
@@ -85,6 +111,9 @@ impl WireFraming {
     pub fn encode_response_fault(self, request_id: u64, out: &mut Vec<u8>) {
         match self {
             WireFraming::Datagram => DatagramFraming.encode_response_fault(request_id, out),
+            WireFraming::Datagram2(protocol) => {
+                Datagram2Framing.encode_reply(protocol, request_id, &Envelope::Fault, out)
+            }
             WireFraming::Jsonrpc => jsonrpc_encode_response_fault(request_id, out),
         }
     }
@@ -92,6 +121,14 @@ impl WireFraming {
     pub fn decode_response<'f>(self, frame: &'f [u8]) -> Option<(u64, Envelope<'f>)> {
         match self {
             WireFraming::Datagram => DatagramFraming.decode_response(frame),
+            WireFraming::Datagram2(_) => match Datagram2Framing.decode(frame)? {
+                Frame::Reply {
+                    request_id,
+                    envelope,
+                    ..
+                } => Some((request_id, envelope)),
+                Frame::Request { .. } => None,
+            },
             WireFraming::Jsonrpc => jsonrpc_decode_response(frame),
         }
     }
@@ -253,7 +290,11 @@ mod tests {
 
     #[test]
     fn a_fault_round_trips_over_both_framings() {
-        for f in [WireFraming::Datagram, WireFraming::Jsonrpc] {
+        for f in [
+            WireFraming::Datagram,
+            WireFraming::Datagram2(3),
+            WireFraming::Jsonrpc,
+        ] {
             let mut frame = Vec::new();
             f.encode_response_fault(9, &mut frame);
             assert_eq!(
@@ -317,5 +358,39 @@ mod tests {
         assert!(std::str::from_utf8(&rpc)
             .unwrap()
             .contains(r#""method":"send""#));
+    }
+
+    #[test]
+    fn datagram2_frames_carry_their_kind_and_protocol() {
+        let f = WireFraming::Datagram2(3);
+        let mut req = Vec::new();
+        f.encode_request(2, "ignored", 5, &("hi",), &Json, &mut req)
+            .unwrap();
+        // [kind 0][protocol varint][call_id u16 LE][request_id u64 LE][params]
+        assert_eq!(&req[..4], &[0, 3, 2, 0]);
+        let decoded = f.decode_request(&req).unwrap();
+        assert_eq!(decoded.call, RequestCall::Id(2));
+        assert_eq!(decoded.request_id, 5);
+        // A request is never mistaken for a reply, which datagram@1 can't tell.
+        assert_eq!(f.decode_response(&req), None);
+
+        let mut resp = Vec::new();
+        f.encode_response_ok(5, b"body", &mut resp);
+        assert_eq!(&resp[..2], &[1, 3]);
+        assert_eq!(f.decode_response(&resp), Some((5, Envelope::Ok(b"body"))));
+        assert_eq!(f.decode_request(&resp), None);
+
+        let mut err = Vec::new();
+        f.encode_response_err(5, 1, b"why", &mut err);
+        assert_eq!(
+            f.decode_response(&err),
+            Some((
+                5,
+                Envelope::Err {
+                    id: 1,
+                    body: b"why"
+                }
+            ))
+        );
     }
 }
