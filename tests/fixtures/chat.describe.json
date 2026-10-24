@@ -6,7 +6,7 @@
       "protocols": [
         {
           "name": "Chat",
-          "framing": "datagram",
+          "framing": "datagram@2",
           "functions": [
             {
               "name": "send",

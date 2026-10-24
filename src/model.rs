@@ -84,6 +84,8 @@ pub enum FramingChoice {
     #[default]
     Auto,
     Datagram,
+    #[serde(rename = "datagram@2")]
+    Datagram2,
     Jsonrpc,
 }
 
@@ -92,6 +94,7 @@ impl FramingChoice {
         match s {
             "auto" => Some(FramingChoice::Auto),
             "datagram" => Some(FramingChoice::Datagram),
+            "datagram@2" => Some(FramingChoice::Datagram2),
             "jsonrpc" => Some(FramingChoice::Jsonrpc),
             _ => None,
         }

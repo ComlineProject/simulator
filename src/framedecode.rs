@@ -92,7 +92,9 @@ fn name_of(hash: u64) -> String {
     for name in [
         comline_runtime::contract::FORMAT_JSON,
         comline_runtime::contract::FORMAT_MSGPACK,
+        comline_runtime::contract::FORMAT_PACKED,
         WireFraming::Datagram.name(),
+        WireFraming::Datagram2(0).name(),
         WireFraming::Jsonrpc.name(),
     ] {
         if name_hash(name) == hash {
@@ -247,7 +249,7 @@ mod tests {
         assert_eq!(hs.kind, "handshake");
         let h = hs.handshake.unwrap();
         assert_eq!(h.wire_format, comline_runtime::contract::FORMAT_JSON);
-        assert_eq!(h.framing, WireFraming::Datagram.name());
+        assert_eq!(h.framing, WireFraming::Datagram2(0).name());
         assert_eq!(h.ir_hash, "0x9f2b1c7d4e6a8035"); // the `chat` fixture's placeholder hash
 
         let req = detail(&e, chat::CONN, 3);

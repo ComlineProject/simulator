@@ -649,7 +649,9 @@ mod tests {
         )
         .unwrap();
         let obj = out.as_object().unwrap();
-        assert_eq!(obj.len(), 3);
+        assert_eq!(obj.len(), 5);
+        assert!(obj.contains_key("datagram@2/json"));
+        assert!(obj.contains_key("datagram@2/msgpack"));
         assert!(obj.contains_key("datagram/json"));
         assert!(obj.contains_key("datagram/msgpack"));
         assert!(obj.contains_key("jsonrpc/json"));
