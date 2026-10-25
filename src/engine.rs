@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use crate::behavior::{BehaviorKind, BehaviorStep, SimOutcome};
 use crate::clock::Clock;
 use crate::faults::{Direction, FaultSpec};
-use crate::format::{Codec, Preencoded};
+use crate::format::Codec;
 use crate::frame::Tap;
 use crate::framing::WireFraming;
 use crate::generic::{BehaviorMap, GenericDispatch};
@@ -498,17 +498,8 @@ impl Engine {
             .encode_body(params, Body::Args(&function.args), &wire.types, &mut body)?;
         let mut frame = Vec::new();
         let id = self.next_request_id + 1;
-        wire.framing.encode_request(
-            call_id,
-            fn_name,
-            id,
-            &(),
-            &Preencoded {
-                name: wire.codec.name(),
-                bytes: &body,
-            },
-            &mut frame,
-        )?;
+        wire.framing
+            .encode_request(call_id, fn_name, id, one_way, &body, &mut frame);
         self.next_request_id = id;
         wire.fn_of.insert(id, index);
 

@@ -133,33 +133,6 @@ impl Codec {
     }
 }
 
-/// A body already encoded by [`Codec::encode_body`], handed to a framing that
-/// wants a [`WireFormat`]: it writes the bytes as they are, under the codec's
-/// name. It can't decode anything.
-pub struct Preencoded<'a> {
-    pub name: &'static str,
-    pub bytes: &'a [u8],
-}
-
-impl WireFormat for Preencoded<'_> {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn encode<T: Serialize + ?Sized>(
-        &self,
-        _value: &T,
-        out: &mut dyn BufMut,
-    ) -> Result<(), RuntimeError> {
-        out.put_slice(self.bytes);
-        Ok(())
-    }
-
-    fn decode<'de, T: Deserialize<'de>>(&self, _bytes: &'de [u8]) -> Result<T, RuntimeError> {
-        Err(RuntimeError::Serialization)
-    }
-}
-
 impl WireFormat for Codec {
     fn name(&self) -> &'static str {
         match self {
@@ -249,18 +222,5 @@ mod tests {
         assert_eq!(Codec::default(), Codec::Packed);
         assert_eq!(Codec::default().name(), FORMAT_PACKED);
         assert_eq!(Codec::json(), Codec::Json);
-    }
-
-    #[test]
-    fn preencoded_writes_its_bytes_as_they_are() {
-        let p = Preencoded {
-            name: FORMAT_PACKED,
-            bytes: &[1, 2, 3],
-        };
-        let mut out = Vec::new();
-        p.encode(&"ignored", &mut out).unwrap();
-        assert_eq!(out, [1, 2, 3]);
-        assert_eq!(p.name(), FORMAT_PACKED);
-        assert!(p.decode::<Value>(&out).is_err());
     }
 }
