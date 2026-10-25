@@ -15,12 +15,14 @@ crate-type = ["cdylib", "rlib"]
 # format. `alloc` only: `std` pulls `libloading` (dylib) which won't build for
 # wasm32. The simulator supplies its own `WireFormat` (JSON), tapped transport
 # and pump on top of these.
-comline-runtime = { git = "https://github.com/ComlineProject/runtime", rev = "6a208d78e6cca289bcca73944c0e683683fca87c", default-features = false, features = ["alloc"] }
+comline-runtime = { git = "https://github.com/ComlineProject/runtime", rev = "78320db7da766b76b5a93a16332e64de73316a5d", default-features = false, features = ["alloc"] }
 
 serde = { version = "1", features = ["derive"] }
 # `raw_value` lets the JSON-RPC framing splice an already-encoded params / body
-# value into its envelope without a re-parse.
-serde_json = { version = "1", features = ["raw_value"] }
+# value into its envelope without a re-parse. `float_roundtrip`: read every
+# `f64` back exactly, not one ulp off (the default parser is faster but
+# best-effort), as comline-runtime's JSON format does.
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
 # MessagePack wire format (milestone 2g), alongside JSON.
 rmp-serde = "1"
 # base64url for the shareable session link (`#s=…`) and recordings

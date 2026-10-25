@@ -201,6 +201,21 @@ mod tests {
         codec.decode::<serde_json::Value>(&buf).unwrap()
     }
 
+    // runtime's `format-json/found-f64-exact-digits`: serde_json's default
+    // float parser reads this one ulp off.
+    #[test]
+    fn an_f64_reads_back_exactly() {
+        let x = 4.520618856987477e-279_f64;
+        let bytes = b"4.520618856987477e-279";
+        assert_eq!(Json.decode::<f64>(bytes).map(f64::to_bits), Ok(x.to_bits()));
+        let value: serde_json::Value = Json.decode(bytes).unwrap();
+        assert_eq!(value.as_f64().map(f64::to_bits), Some(x.to_bits()));
+
+        let mut buf = Vec::new();
+        Json.encode(&x, &mut buf).unwrap();
+        assert_eq!(buf, bytes);
+    }
+
     #[test]
     fn both_codecs_round_trip_a_value() {
         let v = json!({ "body": "hi", "seq": 7, "tags": ["a", "b"], "ok": true, "n": null });
