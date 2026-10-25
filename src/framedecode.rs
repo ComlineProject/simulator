@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(req.kind, "request");
         assert_eq!(req.framing, WireFraming::Datagram2(0).name());
         assert_eq!(req.function.as_deref(), Some("send"));
-        assert_eq!(req.params, Some(json!(["hi"])));
+        assert_eq!(req.params, Some(json!({ "text": "hi" })));
 
         let res = detail(&e, chat::CONN, 4);
         assert_eq!(res.kind, "response");

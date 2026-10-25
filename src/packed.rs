@@ -138,26 +138,29 @@ impl Serialize for Typed<'_> {
                 Value::Null => s.serialize_none(),
                 value => s.serialize_some(&self.with(value, Ty::Of(ty))),
             },
+            // Arguments come named (`{"text": ..}`, what the playground sends)
+            // or in declaration order; either way they go out in order.
             Ty::Args(args) => {
-                let items: &[Value] = match value {
-                    Value::Array(items) => items,
-                    Value::Null => &[],
+                let mut out = s.serialize_tuple(args.len())?;
+                match value {
+                    Value::Object(named) => {
+                        for arg in args {
+                            let item = named.get(&arg.name).unwrap_or(&Value::Null);
+                            out.serialize_element(&self.with(item, Ty::Of(&arg.ty)))?;
+                        }
+                    }
+                    Value::Array(items) if items.len() == args.len() => {
+                        for (arg, item) in args.iter().zip(items) {
+                            out.serialize_element(&self.with(item, Ty::Of(&arg.ty)))?;
+                        }
+                    }
+                    Value::Null if args.is_empty() => {}
                     other => {
                         return Err(S::Error::custom(format!(
-                            "arguments {other} aren't an array"
+                            "arguments {other} don't fit the function's {}",
+                            args.len()
                         )))
                     }
-                };
-                if items.len() != args.len() {
-                    return Err(S::Error::custom(format!(
-                        "{} arguments, where the function takes {}",
-                        items.len(),
-                        args.len()
-                    )));
-                }
-                let mut out = s.serialize_tuple(args.len())?;
-                for (arg, item) in args.iter().zip(items) {
-                    out.serialize_element(&self.with(item, Ty::Of(&arg.ty)))?;
                 }
                 out.end()
             }
@@ -399,15 +402,17 @@ impl<'de> Visitor<'de> for Args<'_> {
         write!(f, "{} arguments", self.1.len())
     }
 
+    /// Decoded arguments are named, the shape behaviours and scripts read
+    /// (`params.text`) whatever the wire format.
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-        let mut items = Vec::with_capacity(self.1.len());
+        let mut named = serde_json::Map::with_capacity(self.1.len());
         for (i, arg) in self.1.iter().enumerate() {
             let item = seq
                 .next_element_seed(self.0.with(Ty::Of(&arg.ty)))?
                 .ok_or_else(|| de::Error::invalid_length(i, &self))?;
-            items.push(item);
+            named.insert(arg.name.clone(), item);
         }
-        Ok(Value::Array(items))
+        Ok(Value::Object(named))
     }
 }
 
@@ -679,10 +684,21 @@ mod tests {
         let mut want = Vec::new();
         Packed.encode(&("hi", 5u32), &mut want).unwrap();
         assert_eq!(out, want);
+        // Named arguments lay out the same, and decode named.
+        let mut named = Vec::new();
+        encode(
+            &json!({ "n": 5, "text": "hi" }),
+            Body::Args(&args),
+            &[],
+            &mut named,
+        )
+        .unwrap();
+        assert_eq!(named, want);
         assert_eq!(
             decode(&out, Body::Args(&args), &[]).unwrap(),
-            json!(["hi", 5])
+            json!({ "text": "hi", "n": 5 })
         );
+        assert!(encode(&json!(["hi"]), Body::Args(&args), &[], &mut Vec::new()).is_err());
 
         let fields = [field("reason", prim("string"), false)];
         let mut out = Vec::new();

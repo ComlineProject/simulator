@@ -614,7 +614,7 @@ mod tests {
         let req: Value = serde_json::from_str(&s.describe_frame(&conn, 3).unwrap()).unwrap();
         assert_eq!(req["kind"], "request");
         assert_eq!(req["fn"], "send");
-        assert_eq!(req["params"], json!(["hi"]));
+        assert_eq!(req["params"], json!({ "text": "hi" }));
         let _ = id;
     }
 

@@ -155,7 +155,7 @@ mod tests {
         let mut behaviors: BehaviorMap = HashMap::new();
         behaviors.insert("send".into(), Box::new(Echo));
 
-        let params = serde_json::json!(["hello"]);
+        let params = serde_json::json!({ "text": "hello" });
         let mut bytes = Vec::new();
         Codec::Packed
             .encode_body(
