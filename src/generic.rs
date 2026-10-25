@@ -110,7 +110,20 @@ mod tests {
             BehaviorStep::Now(_)
         ));
         assert!(matches!(
-            step(&d, RequestCall::Name("send"), &Value::Null, &mut behaviors).unwrap(),
+            step(
+                &d,
+                RequestCall::Name("send".into()),
+                &Value::Null,
+                &mut behaviors
+            )
+            .unwrap(),
+            BehaviorStep::Now(_)
+        ));
+        // A JSON-RPC frame may spell the name with escapes (`s\u0065nd`).
+        let escaped = format!("s{}u0065nd", '\\');
+        let name = comline_runtime::contract::MethodName::from_json(&escaped).unwrap();
+        assert!(matches!(
+            step(&d, RequestCall::Name(name), &Value::Null, &mut behaviors).unwrap(),
             BehaviorStep::Now(_)
         ));
     }
@@ -131,7 +144,13 @@ mod tests {
             RuntimeError::UnknownCall
         );
         assert_eq!(
-            step(&d, RequestCall::Name("nope"), &Value::Null, &mut behaviors).unwrap_err(),
+            step(
+                &d,
+                RequestCall::Name("nope".into()),
+                &Value::Null,
+                &mut behaviors
+            )
+            .unwrap_err(),
             RuntimeError::UnknownCall
         );
     }

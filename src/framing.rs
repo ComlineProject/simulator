@@ -13,7 +13,7 @@ use serde_json::value::RawValue;
 
 use comline_runtime::contract::{
     BufMut, Call, ConnectionFraming, Datagram2Framing, DatagramFraming, Envelope, Frame, Framing,
-    ProtocolNumber, Request, RequestCall, RuntimeError, WireFormat,
+    MethodName, ProtocolNumber, Request, RequestCall, RuntimeError, WireFormat,
 };
 
 /// How a connection frames its calls.
@@ -135,9 +135,77 @@ impl WireFraming {
 }
 
 // ── JSON-RPC 2.0 (verbatim from comline-runtime's `framing` module) ────────
+//
+// Keep this in step with `comline_runtime::framing::JsonRpcFraming`: it reads
+// and writes the same bytes, and its tests carry the runtime's conformance
+// cases for it.
 
 fn u64_bytes(n: u64) -> Vec<u8> {
     n.to_string().into_bytes()
+}
+
+#[derive(Deserialize)]
+struct ErrIn<'a> {
+    code: i64,
+    #[serde(borrow, default)]
+    data: Option<&'a RawValue>,
+}
+
+/// Reads a frame as `T`. JSON text is UTF-8 (RFC 8259 §8.1), all of it:
+/// serde_json checks only the strings it reads, and skips a member `T`
+/// ignores (`jsonrpc`, `error.message`, an unknown one) without looking, so
+/// the whole frame is checked first. Read from a `str`, serde_json then
+/// doesn't check its strings again.
+fn parse<'f, T: Deserialize<'f>>(frame: &'f [u8]) -> Option<T> {
+    serde_json::from_str(std::str::from_utf8(frame).ok()?).ok()
+}
+
+/// The method a request names, from its `method` member, which must be a
+/// string. It's read as written, so a name in any JSON spelling is borrowed
+/// from the frame rather than copied out to unescape it.
+fn method_of(method: &RawValue) -> Option<MethodName<'_>> {
+    let text = method.get().strip_prefix('"')?.strip_suffix('"')?;
+    MethodName::from_json(text)
+}
+
+/// Writes `{"jsonrpc":"2.0","method":<name>,"params":`, with the name a
+/// JSON string escaped as serde_json escapes one: `"` and `\` by backslash,
+/// control characters as `\b`, `\f`, `\n`, `\r`, `\t` or `\u00XX`, and
+/// nothing else. A generated name needs no escape, and goes out in one slice.
+fn put_method(name: &str, out: &mut dyn BufMut) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.put_slice(br#"{"jsonrpc":"2.0","method":""#);
+    let bytes = name.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let control;
+        let escaped: &[u8] = match b {
+            b'"' => br#"\""#,
+            b'\\' => br"\\",
+            b'\n' => br"\n",
+            b'\r' => br"\r",
+            b'\t' => br"\t",
+            0x08 => br"\b",
+            0x0c => br"\f",
+            0x00..=0x1f => {
+                control = [
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[usize::from(b >> 4)],
+                    HEX[usize::from(b & 0xf)],
+                ];
+                &control
+            }
+            _ => continue,
+        };
+        out.put_slice(&bytes[start..i]);
+        out.put_slice(escaped);
+        start = i + 1;
+    }
+    out.put_slice(&bytes[start..]);
+    out.put_slice(br#"","params":"#);
 }
 
 fn jsonrpc_encode_request<W, P>(
@@ -151,10 +219,7 @@ where
     W: WireFormat,
     P: Serialize + ?Sized,
 {
-    // method names are generated identifiers — no JSON escaping needed.
-    out.put_slice(br#"{"jsonrpc":"2.0","method":""#);
-    out.put_slice(method.as_bytes());
-    out.put_slice(br#"","params":"#);
+    put_method(method, out);
     fmt.encode(params, out)?;
     out.put_slice(br#","id":"#);
     out.put_slice(&u64_bytes(request_id));
@@ -165,15 +230,16 @@ where
 fn jsonrpc_decode_request(frame: &[u8]) -> Option<Request<'_>> {
     #[derive(Deserialize)]
     struct ReqIn<'a> {
-        method: &'a str,
+        #[serde(borrow)]
+        method: &'a RawValue,
         #[serde(borrow, default)]
         params: Option<&'a RawValue>,
         #[serde(default)]
         id: Option<u64>,
     }
-    let r: ReqIn = serde_json::from_slice(frame).ok()?;
+    let r: ReqIn = parse(frame)?;
     Some(Request {
-        call: RequestCall::Name(r.method),
+        call: RequestCall::Name(method_of(r.method)?),
         request_id: r.id.unwrap_or(0),
         params: r.params.map(|p| p.get().as_bytes()).unwrap_or(b"null"),
     })
@@ -205,12 +271,6 @@ fn jsonrpc_encode_response_fault(request_id: u64, out: &mut Vec<u8>) {
 
 fn jsonrpc_decode_response(frame: &[u8]) -> Option<(u64, Envelope<'_>)> {
     #[derive(Deserialize)]
-    struct ErrIn<'a> {
-        code: i64,
-        #[serde(borrow, default)]
-        data: Option<&'a RawValue>,
-    }
-    #[derive(Deserialize)]
     struct RespIn<'a> {
         #[serde(borrow, default)]
         result: Option<&'a RawValue>,
@@ -218,7 +278,7 @@ fn jsonrpc_decode_response(frame: &[u8]) -> Option<(u64, Envelope<'_>)> {
         error: Option<ErrIn<'a>>,
         id: u64,
     }
-    let r: RespIn = serde_json::from_slice(frame).ok()?;
+    let r: RespIn = parse(frame)?;
     if let Some(e) = r.error {
         // Only a code inside the ordinal space is a raised schema error. The
         // reserved negative codes are JSON-RPC's own, and a fault is one of
@@ -258,7 +318,7 @@ mod tests {
         );
 
         let req = f.decode_request(&frame).unwrap();
-        assert_eq!(req.call, RequestCall::Name("greet"));
+        assert_eq!(req.call, RequestCall::Name("greet".into()));
         assert_eq!(req.request_id, 1);
         assert_eq!(req.params, br#"[7,"x"]"#);
     }
@@ -392,5 +452,102 @@ mod tests {
                 }
             ))
         );
+    }
+
+    // The cases below are runtime#45's `framing-jsonrpc/found-*` conformance
+    // vectors (runtime#41, #42), byte for byte.
+
+    #[test]
+    fn a_method_name_reads_in_any_json_spelling() {
+        for (frame, name) in [
+            // found-request-method-escaped-slash
+            (
+                &br#"{"jsonrpc":"2.0","method":"app.Chat\/count","params":[],"id":1}"#[..],
+                "app.Chat/count",
+            ),
+            // found-request-method-unicode-escapes
+            (
+                br#"{"jsonrpc":"2.0","method":"\u0067reet\u00E9\ud83d\ude00","params":[],"id":1}"#,
+                "greet\u{e9}\u{1f600}",
+            ),
+        ] {
+            let req = WireFraming::Jsonrpc
+                .decode_request(frame)
+                .unwrap_or_else(|| panic!("refused {name:?}"));
+            let RequestCall::Name(read) = req.call else {
+                panic!("{:?}", req.call)
+            };
+            assert!(read == name, "{name:?}");
+            assert_eq!(read.to_string(), name);
+            assert_eq!(req.request_id, 1);
+            assert_eq!(req.params, b"[]");
+        }
+    }
+
+    #[test]
+    fn a_method_name_is_written_as_serde_json_writes_it() {
+        // found-request-method-needs-escapes
+        let name = "app.Chat/say \"hi\" \\ \n\t\u{1}\u{1f}\u{7f} \u{e9}\u{1f600}";
+        let mut frame = Vec::new();
+        WireFraming::Jsonrpc
+            .encode_request(0, name, 6, &("hi",), &Json, &mut frame)
+            .unwrap();
+        let expected = format!(
+            r#"{{"jsonrpc":"2.0","method":{},"params":["hi"],"id":6}}"#,
+            serde_json::to_string(name).unwrap()
+        );
+        assert_eq!(std::str::from_utf8(&frame).unwrap(), expected);
+        let value: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(value["method"], name);
+
+        let req = WireFraming::Jsonrpc.decode_request(&frame).unwrap();
+        let RequestCall::Name(read) = req.call else {
+            panic!("{:?}", req.call)
+        };
+        assert!(read == name);
+    }
+
+    #[test]
+    fn invalid_utf8_anywhere_refuses_the_frame() {
+        let requests: [&[u8]; 2] = [
+            // found-reject-request-invalid-utf8-in-jsonrpc
+            b"{\"jsonrpc\":\"2.\xff\",\"method\":\"greet\",\"params\":[],\"id\":1}",
+            // found-reject-request-invalid-utf8-in-unknown-member
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"greet\",\"params\":[],\"x\":\"\xff\",\"id\":1}",
+        ];
+        for frame in requests {
+            assert_eq!(
+                WireFraming::Jsonrpc.decode_request(frame),
+                None,
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+        let responses: [&[u8]; 3] = [
+            // found-reject-response-invalid-utf8-in-jsonrpc
+            b"{\"jsonrpc\":\"2.\xff\",\"result\":1,\"id\":1}",
+            // found-reject-response-invalid-utf8-in-unknown-member
+            b"{\"jsonrpc\":\"2.0\",\"result\":1,\"x\":\"\xff\",\"id\":1}",
+            // found-reject-response-invalid-utf8-in-error-message
+            b"{\"jsonrpc\":\"2.0\",\"error\":{\"code\":1,\"message\":\"\xff\"},\"id\":1}",
+        ];
+        for frame in responses {
+            assert_eq!(
+                WireFraming::Jsonrpc.decode_response(frame),
+                None,
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
+        }
+    }
+
+    #[test]
+    fn a_method_that_is_not_a_json_string_is_refused() {
+        for frame in [
+            &br#"{"jsonrpc":"2.0","method":7,"params":[],"id":1}"#[..],
+            br#"{"jsonrpc":"2.0","method":"\ud800","params":[],"id":1}"#,
+        ] {
+            assert_eq!(WireFraming::Jsonrpc.decode_request(frame), None);
+        }
     }
 }
