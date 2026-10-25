@@ -4,11 +4,15 @@
 
 use comline_runtime::contract::{name_hash, Envelope, HandshakeFrame, RequestCall, WireFormat};
 use serde::Serialize;
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 use crate::format::Codec;
 use crate::frame::Frame;
 use crate::framing::WireFraming;
+use crate::packed::Body;
+use crate::shape::{ErrorShape, FnShape, TypeDef};
 
 /// Everything the inspector renders for one frame.
 #[derive(Debug, Serialize)]
@@ -68,6 +72,28 @@ pub struct DecodeCtx<'a> {
     pub codec: Codec,
     /// Function names in protocol order — resolves a datagram request's call id.
     pub fn_names: &'a [&'a str],
+    /// The protocol's functions, in order — a request's arguments are laid out
+    /// by them.
+    pub functions: &'a [FnShape],
+    /// Every type the project declares.
+    pub types: &'a [TypeDef],
+    /// The server's schema's errors — a raised error's body is laid out by the
+    /// fields of the one its ordinal names.
+    pub errors: &'a [ErrorShape],
+    /// request id → index into `functions`, for a response's return type.
+    pub fn_of: &'a HashMap<u64, usize>,
+}
+
+impl DecodeCtx<'_> {
+    fn ok_body(&self, request_id: u64) -> Option<Body<'_>> {
+        let f = self.functions.get(*self.fn_of.get(&request_id)?)?;
+        Some(Body::Return(f.returns.as_ref()))
+    }
+
+    fn err_body(&self, ordinal: u16) -> Option<Body<'_>> {
+        let e = self.errors.iter().find(|e| e.ordinal == ordinal)?;
+        Some(Body::Fields(&e.fields))
+    }
 }
 
 impl FrameDetail {
@@ -109,13 +135,22 @@ fn name_of(hash: u64) -> String {
 ///
 /// A JSON-RPC frame carries its params / body as raw JSON regardless of the
 /// wire format, so those are always JSON-decoded; a datagram frame's body is
-/// whatever the connection's codec produced.
-fn body_of(bytes: &[u8], codec: Codec, always_json: bool) -> (Value, bool) {
+/// whatever the connection's codec produced, laid out as `body` when it's known
+/// (`packed@1` can't be read without it).
+fn body_of(
+    bytes: &[u8],
+    codec: Codec,
+    always_json: bool,
+    body: Option<Body<'_>>,
+    types: &[TypeDef],
+) -> (Value, bool) {
     if bytes.is_empty() {
         return (Value::Null, true);
     }
     let decoded = if always_json {
         serde_json::from_slice::<Value>(bytes).ok()
+    } else if let Some(body) = body {
+        codec.decode_body(bytes, body, types).ok()
     } else {
         codec.decode::<Value>(bytes).ok()
     };
@@ -162,7 +197,17 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
                 .unwrap_or_else(|| format!("#{id}")),
             RequestCall::Name(n) => n.to_string(),
         };
-        let (params, ok) = body_of(req.params, ctx.codec, jsonrpc);
+        let shape = match req.call {
+            RequestCall::Id(id) => ctx.functions.get(id as usize),
+            RequestCall::Name(n) => ctx.functions.iter().find(|f| f.name == n),
+        };
+        let (params, ok) = body_of(
+            req.params,
+            ctx.codec,
+            jsonrpc,
+            shape.map(|f| Body::Args(&f.args)),
+            ctx.types,
+        );
         let mut d = FrameDetail::bare("request", if ok { name } else { "undecodable".into() });
         d.function = Some(function);
         d.request_id = Some(req.request_id.to_string());
@@ -177,14 +222,20 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
     d.request_id = Some(request_id.to_string());
     match envelope {
         Envelope::Ok(payload) => {
-            let (value, ok) = body_of(payload, ctx.codec, jsonrpc);
+            let (value, ok) = body_of(
+                payload,
+                ctx.codec,
+                jsonrpc,
+                ctx.ok_body(request_id),
+                ctx.types,
+            );
             d.ok = Some(value);
             if !ok {
                 d.framing = "undecodable".into();
             }
         }
         Envelope::Err { id, body } => {
-            let (value, ok) = body_of(body, ctx.codec, jsonrpc);
+            let (value, ok) = body_of(body, ctx.codec, jsonrpc, ctx.err_body(id), ctx.types);
             d.err = Some(ErrDetail {
                 ordinal: id,
                 body: value,
@@ -234,13 +285,30 @@ mod tests {
                 framing: info.framing,
                 codec: info.codec,
                 fn_names: &info.fn_names,
+                functions: info.functions,
+                types: info.types,
+                errors: info.errors,
+                fn_of: info.fn_of,
             },
         )
     }
 
+    /// [`chat::session`] with its connection speaking JSON.
+    fn json_session() -> crate::model::Session {
+        let mut session = chat::session();
+        session.set_transport(chat::CONN, crate::model::FramingChoice::Auto, Codec::Json);
+        session
+    }
+
+    fn engine_on(session: &crate::model::Session) -> Engine {
+        let mut e = Engine::new();
+        e.sync(session);
+        e
+    }
+
     #[test]
     fn decodes_the_handshake_request_and_response_of_a_round_trip() {
-        let mut e = chat::engine();
+        let mut e = engine_on(&json_session());
         e.call(chat::CONN, "send", &json!(["hi"])).unwrap();
         e.run();
 
@@ -266,8 +334,31 @@ mod tests {
     }
 
     #[test]
+    fn a_packed_request_and_response_decode_by_the_schema() {
+        let mut e = chat::engine(); // a new connection speaks `packed@1`
+        e.call(chat::CONN, "send", &json!(["hi"])).unwrap();
+        e.run();
+
+        let h = detail(&e, chat::CONN, 1).handshake.unwrap();
+        assert_eq!(h.wire_format, comline_runtime::contract::FORMAT_PACKED);
+
+        let req = detail(&e, chat::CONN, 3);
+        assert_eq!(req.kind, "request");
+        assert_eq!(req.framing, WireFraming::Datagram2(0).name());
+        assert_eq!(req.function.as_deref(), Some("send"));
+        assert_eq!(req.params, Some(json!(["hi"])));
+
+        let res = detail(&e, chat::CONN, 4);
+        assert_eq!(res.kind, "response");
+        assert_eq!(res.framing, WireFraming::Datagram2(0).name());
+        assert_eq!(res.ok, Some(json!({ "body": "HELLO", "seq": 1 })));
+    }
+
+    #[test]
     fn a_corrupted_response_body_reads_as_undecodable() {
-        let mut session = chat::session();
+        // JSON: `packed@1` has no tags, so a flipped bit there often still
+        // decodes — to the wrong value.
+        let mut session = json_session();
         session.connections[0].faults.corrupt_prob = 1.0;
         session.connections[0].faults.apply_to = crate::faults::FaultDir::Responses;
         session.call_timeout_ms = 0.0;
@@ -341,7 +432,8 @@ mod tests {
 
     #[test]
     fn a_raised_error_decodes_its_ordinal_and_body() {
-        let mut session = chat::session();
+        // An undeclared error: only a self-describing format can carry it.
+        let mut session = json_session();
         session
             .set_behavior(
                 &session

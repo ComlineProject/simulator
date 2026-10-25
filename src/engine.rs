@@ -21,14 +21,16 @@ use serde_json::{json, Value};
 use crate::behavior::{BehaviorKind, BehaviorStep, SimOutcome};
 use crate::clock::Clock;
 use crate::faults::{Direction, FaultSpec};
-use crate::format::Codec;
+use crate::format::{Codec, Preencoded};
 use crate::frame::Tap;
 use crate::framing::WireFraming;
 use crate::generic::{BehaviorMap, GenericDispatch};
 use crate::model::{Connection, FramingChoice, Instance, Session};
+use crate::packed::Body;
 use crate::rng::Mulberry32;
 use crate::shape::{
-    find_protocol, protocol_number, Framing as ShapeFraming, ProtocolShape, SchemaShape,
+    find_protocol, protocol_number, ErrorShape, FnShape, Framing as ShapeFraming, ProtocolShape,
+    SchemaShape, TypeDef,
 };
 use crate::wire::{Channel, SendOutcome, REORDER_FLUSH_MS};
 
@@ -95,6 +97,16 @@ struct Wire {
     server_name: String,
     framing: WireFraming,
     codec: Codec,
+    /// Every type the project declares, from every schema — `packed@1` lays a
+    /// body out by them.
+    types: Vec<TypeDef>,
+    /// The server's schema's errors — a raised error's body is laid out by the
+    /// fields of the one its ordinal names.
+    errors: Vec<ErrorShape>,
+    /// request id → the called function's index in the protocol, so a response
+    /// (which names no function) can be laid out by its return type. Kept for
+    /// the wire's life: the inspector decodes old frames with it.
+    fn_of: HashMap<u64, usize>,
     /// `None` when connected; otherwise why it was refused (`"handshake"` for a
     /// version / framing / wire-format mismatch).
     error: Option<String>,
@@ -104,6 +116,68 @@ struct Wire {
     /// Set once a call has timed out — the client half is desynced, every later
     /// call fails fast until the connection is reopened.
     dead: bool,
+}
+
+impl Wire {
+    /// The function `request_id` called, if this wire issued it.
+    fn function_of(&self, request_id: u64) -> Option<&FnShape> {
+        let index = *self.fn_of.get(&request_id)?;
+        self.dispatch.protocol().functions.get(index)
+    }
+
+    fn error_of(&self, ordinal: u16) -> Option<&ErrorShape> {
+        self.errors.iter().find(|e| e.ordinal == ordinal)
+    }
+
+    /// Encode a reply's ok value, laid out by the called function's return
+    /// type. A call the wire doesn't know falls back to the untyped encode.
+    fn encode_ok(
+        &self,
+        request_id: u64,
+        value: &Value,
+        out: &mut Vec<u8>,
+    ) -> Result<(), RuntimeError> {
+        match self.function_of(request_id) {
+            Some(f) => {
+                self.codec
+                    .encode_body(value, Body::Return(f.returns.as_ref()), &self.types, out)
+            }
+            None => self.codec.encode(value, out),
+        }
+    }
+
+    /// Encode a raised error's data, laid out by its fields.
+    fn encode_err(
+        &self,
+        ordinal: u16,
+        data: &Value,
+        out: &mut Vec<u8>,
+    ) -> Result<(), RuntimeError> {
+        match self.error_of(ordinal) {
+            Some(e) => self
+                .codec
+                .encode_body(data, Body::Fields(&e.fields), &self.types, out),
+            None => self.codec.encode(data, out),
+        }
+    }
+
+    fn decode_ok(&self, request_id: u64, bytes: &[u8]) -> Result<Value, RuntimeError> {
+        match self.function_of(request_id) {
+            Some(f) => self
+                .codec
+                .decode_body(bytes, Body::Return(f.returns.as_ref()), &self.types),
+            None => self.codec.decode::<Value>(bytes),
+        }
+    }
+
+    fn decode_err(&self, ordinal: u16, bytes: &[u8]) -> Result<Value, RuntimeError> {
+        match self.error_of(ordinal) {
+            Some(e) => self
+                .codec
+                .decode_body(bytes, Body::Fields(&e.fields), &self.types),
+            None => self.codec.decode::<Value>(bytes),
+        }
+    }
 }
 
 /// A forwarded call in flight: when the inner call settles, answer the outer one.
@@ -124,6 +198,14 @@ pub struct WireInfo<'a> {
     pub codec: Codec,
     pub error: Option<&'a str>,
     pub dead: bool,
+    /// The protocol's functions, in order.
+    pub functions: &'a [FnShape],
+    /// Every type the project declares.
+    pub types: &'a [TypeDef],
+    /// The server's schema's errors.
+    pub errors: &'a [ErrorShape],
+    /// request id → index into `functions`.
+    pub fn_of: &'a HashMap<u64, usize>,
 }
 
 pub struct Engine {
@@ -209,7 +291,7 @@ impl Engine {
 
         // Framing: the connection's choice, else the protocol's. Codec: the
         // connection's. JSON-RPC is a JSON text envelope — it can't carry a
-        // MessagePack body, so that pair is refused.
+        // MessagePack or `packed@1` body, so those pairs are refused.
         // A datagram@2 frame names its protocol by its number on the
         // connection: its position among every protocol in the package.
         let number = protocol_number(&session.shape, &server.schema_ns, &server.protocol);
@@ -224,7 +306,7 @@ impl Engine {
             FramingChoice::Jsonrpc => WireFraming::Jsonrpc,
         };
         let codec = conn.wire_format;
-        let bad_combo = framing == WireFraming::Jsonrpc && codec == Codec::Msgpack;
+        let bad_combo = framing == WireFraming::Jsonrpc && codec != Codec::Json;
 
         // Handshake: record a frame each way (the inspector shows them) and
         // refuse on a mismatch. The two ends always agree on codec + framing, so
@@ -255,6 +337,14 @@ impl Engine {
             server_name: server.name.clone(),
             framing,
             codec,
+            types: session
+                .shape
+                .schemas
+                .iter()
+                .flat_map(|s| s.types.iter().cloned())
+                .collect(),
+            errors: schema.errors.clone(),
+            fn_of: HashMap::new(),
             error,
             timeout_ms: session.call_timeout_ms.max(0.0),
             dead: false,
@@ -351,6 +441,10 @@ impl Engine {
             codec: w.codec,
             error: w.error.as_deref(),
             dead: w.dead,
+            functions: &w.dispatch.protocol().functions,
+            types: &w.types,
+            errors: &w.errors,
+            fn_of: &w.fn_of,
         })
     }
 
@@ -378,29 +472,45 @@ impl Engine {
         fn_name: &str,
         params: &Value,
     ) -> Result<u64, RuntimeError> {
-        let wire = self.wires.get(conn_id).ok_or(RuntimeError::Transport)?;
+        let wire = self.wires.get_mut(conn_id).ok_or(RuntimeError::Transport)?;
         if wire.error.is_some() {
             return Err(RuntimeError::Handshake);
         }
         if wire.dead {
             return Err(RuntimeError::Timeout);
         }
-        let function = wire
+        let (index, function) = wire
             .dispatch
             .protocol()
             .functions
             .iter()
-            .find(|f| f.name == fn_name)
+            .enumerate()
+            .find(|(_, f)| f.name == fn_name)
             .ok_or(RuntimeError::UnknownCall)?;
         let call_id = function.index as u16;
         let one_way = function.oneway;
         let timeout_ms = wire.timeout_ms;
 
-        self.next_request_id += 1;
-        let id = self.next_request_id;
+        // The body first, laid out by the function's arguments; the framing
+        // then carries it as it is.
+        let mut body = Vec::new();
+        wire.codec
+            .encode_body(params, Body::Args(&function.args), &wire.types, &mut body)?;
         let mut frame = Vec::new();
-        wire.framing
-            .encode_request(call_id, fn_name, id, params, &wire.codec, &mut frame)?;
+        let id = self.next_request_id + 1;
+        wire.framing.encode_request(
+            call_id,
+            fn_name,
+            id,
+            &(),
+            &Preencoded {
+                name: wire.codec.name(),
+                bytes: &body,
+            },
+            &mut frame,
+        )?;
+        self.next_request_id = id;
+        wire.fn_of.insert(id, index);
 
         self.emit(conn_id, Direction::Request, frame);
         if one_way {
@@ -511,11 +621,13 @@ impl Engine {
             return;
         };
         let request_id = req.request_id;
-        let codec = wire.codec;
-        let step = match wire
-            .dispatch
-            .dispatch(req.call, req.params, &codec, &mut wire.behaviors)
-        {
+        let step = match wire.dispatch.dispatch(
+            req.call,
+            req.params,
+            &wire.codec,
+            &wire.types,
+            &mut wire.behaviors,
+        ) {
             Ok(step) => step,
             Err(_) => return,
         };
@@ -546,12 +658,11 @@ impl Engine {
         let Some(wire) = self.wires.get(conn_id) else {
             return;
         };
-        let codec = wire.codec;
         let Some((request_id, envelope)) = wire.framing.decode_response(response_frame) else {
             return;
         };
         let result = match envelope {
-            Envelope::Ok(payload) => match codec.decode::<Value>(payload) {
+            Envelope::Ok(payload) => match wire.decode_ok(request_id, payload) {
                 Ok(value) => CallResult::Ok(value),
                 Err(_) => CallResult::Undecodable("ok body did not decode".into()),
             },
@@ -559,7 +670,7 @@ impl Engine {
                 let body = if body.is_empty() {
                     Value::Null
                 } else {
-                    codec.decode::<Value>(body).unwrap_or(Value::Null)
+                    wire.decode_err(id, body).unwrap_or(Value::Null)
                 };
                 CallResult::Err { ordinal: id, body }
             }
@@ -573,23 +684,37 @@ impl Engine {
         let Some(wire) = self.wires.get(conn_id) else {
             return;
         };
-        let (framing, codec) = (wire.framing, wire.codec);
+        let framing = wire.framing;
         let mut resp = Vec::new();
         let mut note = None;
+        // A behaviour's value that the wire format can't carry — under
+        // `packed@1`, one that isn't the declared type — is the provider
+        // failing, so it goes out as a fault rather than leaving the call to
+        // hang.
+        let unencodable = |what: &str| {
+            Some(format!(
+                "the {what} doesn't fit the schema, so {} can't encode it",
+                wire.codec.name()
+            ))
+        };
         match outcome {
             SimOutcome::Ok(value) => {
                 let mut body = Vec::new();
-                if codec.encode(&value, &mut body).is_err() {
-                    return;
+                if wire.encode_ok(request_id, &value, &mut body).is_ok() {
+                    framing.encode_response_ok(request_id, &body, &mut resp);
+                } else {
+                    framing.encode_response_fault(request_id, &mut resp);
+                    note = unencodable("reply");
                 }
-                framing.encode_response_ok(request_id, &body, &mut resp);
             }
             SimOutcome::Err { ordinal, data } => {
                 let mut body = Vec::new();
-                if codec.encode(&data, &mut body).is_err() {
-                    return;
+                if wire.encode_err(ordinal, &data, &mut body).is_ok() {
+                    framing.encode_response_err(request_id, ordinal, &body, &mut resp);
+                } else {
+                    framing.encode_response_fault(request_id, &mut resp);
+                    note = unencodable("error's data");
                 }
-                framing.encode_response_err(request_id, ordinal, &body, &mut resp);
             }
             SimOutcome::Fault { note: why } => {
                 framing.encode_response_fault(request_id, &mut resp);
@@ -727,9 +852,11 @@ fn build_behaviors(server: &Instance, proto: &ProtocolShape, schema: &SchemaShap
 
 /// The framing / codec combinations the compare panel runs (2g). JSON-RPC pairs
 /// only with JSON.
-pub const TRANSPORT_MATRIX: [(FramingChoice, Codec); 5] = [
+pub const TRANSPORT_MATRIX: [(FramingChoice, Codec); 7] = [
+    (FramingChoice::Datagram2, Codec::Packed),
     (FramingChoice::Datagram2, Codec::Json),
     (FramingChoice::Datagram2, Codec::Msgpack),
+    (FramingChoice::Datagram, Codec::Packed),
     (FramingChoice::Datagram, Codec::Json),
     (FramingChoice::Datagram, Codec::Msgpack),
     (FramingChoice::Jsonrpc, Codec::Json),
@@ -959,7 +1086,10 @@ mod tests {
 
     #[test]
     fn behaviour_swap_takes_effect_on_the_next_call() {
-        let session = chat::session();
+        // `echo` replies with the arguments, which aren't a `Message`: only a
+        // self-describing format carries them.
+        let mut session = chat::session();
+        session.set_transport(CONN, FramingChoice::Auto, Codec::Json);
         let mut e = Engine::new();
         e.sync(&session);
 
@@ -1300,7 +1430,7 @@ mod tests {
     fn compare_transports_agrees_on_the_body_and_differs_on_the_frames() {
         let session = chat::session();
         let runs = compare_transports(&session, chat::CONN, "send", &json!(["hi"]));
-        assert_eq!(runs.len(), 5);
+        assert_eq!(runs.len(), 7);
 
         // every combo decodes to the same reply
         for run in &runs {
@@ -1329,7 +1459,14 @@ mod tests {
         let dg_mp = req_bytes("datagram/msgpack");
         let rpc = req_bytes("jsonrpc/json");
         let dg2_json = req_bytes("datagram@2/json");
+        let dg_packed = req_bytes("datagram/packed");
         assert!(dg_mp.len() < dg_json.len(), "msgpack is tighter");
+        assert!(dg_packed.len() < dg_mp.len(), "packed@1 is tighter still");
+        assert_eq!(
+            &req_bytes("datagram@2/packed")[2..],
+            &dg_packed[..],
+            "the same call frame under datagram@2"
+        );
         // datagram@2 adds the kind byte and the protocol number, then the same
         // call frame.
         assert_eq!(dg2_json.len(), dg_json.len() + 2);
@@ -1337,5 +1474,142 @@ mod tests {
         assert!(std::str::from_utf8(&rpc)
             .unwrap()
             .contains("\"method\":\"send\""));
+    }
+
+    // ── packed@1 ────────────────────────────────────────────────────────
+
+    /// The chat fixture with `send` able to raise `Refused { why: string }`
+    /// (ordinal 3), over datagram@2 + `packed@1`.
+    fn packed_session() -> Session {
+        let mut session = chat::session();
+        let schema = &mut session.shape.schemas[0];
+        schema.errors.push(ErrorShape {
+            ordinal: 3,
+            name: "Refused".into(),
+            message: "refused".into(),
+            fields: vec![crate::shape::FieldShape {
+                name: "why".into(),
+                ty: crate::shape::TypeRef::Prim {
+                    name: "string".into(),
+                },
+                optional: false,
+            }],
+        });
+        session.set_transport(CONN, FramingChoice::Datagram2, Codec::Packed);
+        session
+    }
+
+    fn server_of(session: &Session) -> String {
+        session
+            .instances
+            .iter()
+            .find(|i| i.role == Role::Server)
+            .unwrap()
+            .id
+            .clone()
+    }
+
+    #[test]
+    fn a_new_connection_speaks_packed() {
+        let e = chat::engine();
+        assert_eq!(e.wire_info(CONN).unwrap().codec, Codec::Packed);
+    }
+
+    #[test]
+    fn a_packed_call_settles_with_the_reply() {
+        let mut e = Engine::new();
+        e.sync(&packed_session());
+        assert!(e.connection_error(CONN).is_none());
+
+        let id = e.call(CONN, "send", &json!(["hi"])).unwrap();
+        e.run();
+        assert_eq!(e.result(id), Some(&CallResult::Ok(hello())));
+
+        // No tags, no names: the request body is the string's length and
+        // bytes, the reply's the string then the u64.
+        let p = payload_frames(&e, CONN);
+        assert!(p[0].bytes.ends_with(b"\x02hi"));
+        assert!(!p[1].bytes.windows(4).any(|w| w == b"body"));
+    }
+
+    #[test]
+    fn a_packed_raised_error_round_trips_its_body() {
+        let mut session = packed_session();
+        let srv = server_of(&session);
+        session
+            .set_behavior(
+                &srv,
+                "send",
+                BehaviorKind::Raise,
+                Some(json!({ "ordinal": 3, "data": { "why": "nope" } })),
+            )
+            .unwrap();
+        let mut e = Engine::new();
+        e.sync(&session);
+
+        let id = e.call(CONN, "send", &json!(["hi"])).unwrap();
+        e.run();
+        assert_eq!(
+            e.result(id),
+            Some(&CallResult::Err {
+                ordinal: 3,
+                body: json!({ "why": "nope" })
+            })
+        );
+    }
+
+    #[test]
+    fn a_packed_fault_settles_as_a_fault() {
+        let mut session = packed_session();
+        let srv = server_of(&session);
+        session
+            .set_behavior(&srv, "send", BehaviorKind::Fault, Some(json!({})))
+            .unwrap();
+        let mut e = Engine::new();
+        e.sync(&session);
+
+        let id = e.call(CONN, "send", &json!(["hi"])).unwrap();
+        e.run();
+        assert_eq!(e.result(id), Some(&CallResult::Fault));
+    }
+
+    #[test]
+    fn a_reply_that_isnt_the_return_type_faults_under_packed() {
+        // `echo` replies with the arguments, not a `Message`.
+        let mut session = packed_session();
+        let srv = server_of(&session);
+        session
+            .set_behavior(&srv, "send", BehaviorKind::Echo, Some(json!({})))
+            .unwrap();
+        let mut e = Engine::new();
+        e.sync(&session);
+
+        let id = e.call(CONN, "send", &json!(["hi"])).unwrap();
+        e.run();
+        assert_eq!(e.result(id), Some(&CallResult::Fault));
+        let note = payload_frames(&e, CONN)[1].note.clone().unwrap();
+        assert!(note.contains("packed@1"), "{note}");
+    }
+
+    #[test]
+    fn arguments_that_dont_fit_the_function_are_refused_at_the_call() {
+        let mut e = Engine::new();
+        e.sync(&packed_session());
+        assert_eq!(
+            e.call(CONN, "send", &json!([42])).unwrap_err(),
+            RuntimeError::Serialization
+        );
+    }
+
+    #[test]
+    fn json_rpc_with_packed_is_refused() {
+        let mut session = chat::session();
+        session.set_transport(chat::CONN, FramingChoice::Jsonrpc, Codec::Packed);
+        let mut e = Engine::new();
+        e.sync(&session);
+        assert_eq!(
+            e.connection_error(chat::CONN),
+            Some("json-rpc framing requires the json codec")
+        );
     }
 }

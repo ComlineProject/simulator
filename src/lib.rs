@@ -32,6 +32,7 @@ pub mod framedecode;
 pub mod framing;
 pub mod generic;
 pub mod model;
+pub mod packed;
 pub mod record;
 pub mod rng;
 pub mod session_codec;

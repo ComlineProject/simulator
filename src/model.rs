@@ -114,8 +114,10 @@ pub struct Connection {
     /// as `Auto`.
     #[serde(default)]
     pub framing: FramingChoice,
-    /// The wire format (JSON / MessagePack).
-    #[serde(default)]
+    /// The wire format (`packed@1` / JSON / MessagePack). A new connection
+    /// speaks `packed@1`; an old link without the field decodes as JSON, the
+    /// only format there was when it was made.
+    #[serde(default = "Codec::json")]
     pub wire_format: Codec,
 }
 
@@ -520,6 +522,27 @@ mod tests {
 
     fn base_session() -> Session {
         Session::empty(chat_shape(vec![chat_fn("send", 0, false)], "0xaaaa"))
+    }
+
+    #[test]
+    fn a_new_connection_speaks_packed_and_an_old_link_reads_as_json() {
+        let mut s = base_session();
+        let srv = s.add_instance(spec(Role::Server), Placement::default());
+        let cli = s.add_instance(spec(Role::Client), Placement::default());
+        let id = s.add_connection(&cli, &srv).unwrap();
+        let conn = s.connections.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(conn.wire_format, Codec::Packed);
+
+        // A link from before `packed@1` has no `wireFormat` key.
+        let mut old = serde_json::to_value(conn).unwrap();
+        old.as_object_mut().unwrap().remove("wireFormat").unwrap();
+        let back: Connection = serde_json::from_value(old).unwrap();
+        assert_eq!(back.wire_format, Codec::Json);
+
+        // An explicit one is kept.
+        let round: Connection =
+            serde_json::from_value(serde_json::to_value(conn).unwrap()).unwrap();
+        assert_eq!(round.wire_format, Codec::Packed);
     }
 
     #[test]

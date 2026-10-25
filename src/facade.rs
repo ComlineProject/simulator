@@ -274,7 +274,7 @@ impl Sim {
     }
 
     /// Set a connection's framing (`auto` / `datagram` / `jsonrpc`) and wire
-    /// format (`json` / `msgpack`), then re-open the wire.
+    /// format (`packed` / `json` / `msgpack`), then re-open the wire.
     pub fn set_transport(
         &mut self,
         conn_id: &str,
@@ -410,6 +410,10 @@ impl Sim {
                 framing: info.framing,
                 codec: info.codec,
                 fn_names: &info.fn_names,
+                functions: info.functions,
+                types: info.types,
+                errors: info.errors,
+                fn_of: info.fn_of,
             },
         );
         serde_json::to_string(&detail).ok()
@@ -539,6 +543,10 @@ mod tests {
             .try_add_instance(r#"{"schemaNs":"chat","protocol":"Chat","role":"client"}"#)
             .unwrap();
         let conn = s.session.add_connection(&cli, &srv).unwrap();
+        // `echo` replies with the arguments, which aren't a `Message`: only a
+        // self-describing format carries them.
+        s.session
+            .set_transport(&conn, FramingChoice::Auto, Codec::Json);
         s.engine.sync(&s.session);
 
         s.try_set_behavior(&srv, "send", "echo", "{}").unwrap();
@@ -560,6 +568,10 @@ mod tests {
             .try_add_instance(r#"{"schemaNs":"chat","protocol":"Chat","role":"client"}"#)
             .unwrap();
         let conn = s.session.add_connection(&cli, &srv).unwrap();
+        // The script's reply isn't a `Message`: only a self-describing format
+        // carries it.
+        s.session
+            .set_transport(&conn, FramingChoice::Auto, Codec::Json);
         s.engine.sync(&s.session);
 
         let cfg = json!({ "source": "#{ echoed: params[0] }" }).to_string();
@@ -649,7 +661,9 @@ mod tests {
         )
         .unwrap();
         let obj = out.as_object().unwrap();
-        assert_eq!(obj.len(), 5);
+        assert_eq!(obj.len(), 7);
+        assert!(obj.contains_key("datagram@2/packed"));
+        assert!(obj.contains_key("datagram/packed"));
         assert!(obj.contains_key("datagram@2/json"));
         assert!(obj.contains_key("datagram@2/msgpack"));
         assert!(obj.contains_key("datagram/json"));
