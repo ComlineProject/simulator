@@ -11,11 +11,13 @@
 
 use std::collections::HashMap;
 
-use comline_runtime::contract::{RequestCall, RuntimeError, WireFormat};
+use comline_runtime::contract::{RequestCall, RuntimeError};
 use serde_json::Value;
 
 use crate::behavior::{Behavior, BehaviorCtx, BehaviorStep};
-use crate::shape::ProtocolShape;
+use crate::format::Codec;
+use crate::packed::Body;
+use crate::shape::{ProtocolShape, TypeDef};
 
 /// One behaviour per function name. The engine swaps entries live so a
 /// behaviour change takes effect on the next call with no reconnect.
@@ -36,12 +38,15 @@ impl GenericDispatch {
     }
 
     /// Resolve the call and run its behaviour. `behaviors` is passed in (not
-    /// held) so the pump keeps ownership of the live, swappable map.
-    pub fn dispatch<W: WireFormat>(
+    /// held) so the pump keeps ownership of the live, swappable map. `types` is
+    /// every type the project declares — `packed@1` needs them to lay the
+    /// arguments out.
+    pub fn dispatch(
         &self,
         call: RequestCall<'_>,
         params: &[u8],
-        fmt: &W,
+        codec: &Codec,
+        types: &[TypeDef],
         behaviors: &mut BehaviorMap,
     ) -> Result<BehaviorStep, RuntimeError> {
         let idx = self.resolve(call).ok_or(RuntimeError::UnknownCall)?;
@@ -54,7 +59,7 @@ impl GenericDispatch {
         let decoded = if params.is_empty() {
             Value::Null
         } else {
-            fmt.decode::<Value>(params)?
+            codec.decode_body(params, Body::Args(&function.args), types)?
         };
 
         Ok(behavior.run(BehaviorCtx {
@@ -81,7 +86,7 @@ mod tests {
 
     use crate::behavior::{BehaviorKind, Echo, SimOutcome};
     use crate::fixtures::{proto as chat_proto, schema as chat_schema};
-    use crate::format::Json;
+    use comline_runtime::contract::WireFormat;
 
     fn step(
         d: &GenericDispatch,
@@ -90,8 +95,8 @@ mod tests {
         behaviors: &mut BehaviorMap,
     ) -> Result<BehaviorStep, RuntimeError> {
         let mut bytes = Vec::new();
-        Json.encode(params, &mut bytes).unwrap();
-        d.dispatch(call, &bytes, &Json, behaviors)
+        Codec::Json.encode(params, &mut bytes).unwrap();
+        d.dispatch(call, &bytes, &Codec::Json, &[], behaviors)
     }
 
     #[test]
@@ -140,6 +145,35 @@ mod tests {
         let params = serde_json::json!(["hello"]);
         assert_eq!(
             step(&d, RequestCall::Id(0), &params, &mut behaviors).unwrap(),
+            BehaviorStep::Now(SimOutcome::Ok(params))
+        );
+    }
+
+    #[test]
+    fn packed_params_are_laid_out_by_the_function_s_arguments() {
+        let d = GenericDispatch::new(chat_proto());
+        let mut behaviors: BehaviorMap = HashMap::new();
+        behaviors.insert("send".into(), Box::new(Echo));
+
+        let params = serde_json::json!({ "text": "hello" });
+        let mut bytes = Vec::new();
+        Codec::Packed
+            .encode_body(
+                &params,
+                Body::Args(&chat_proto().functions[0].args),
+                &[],
+                &mut bytes,
+            )
+            .unwrap();
+        assert_eq!(
+            d.dispatch(
+                RequestCall::Id(0),
+                &bytes,
+                &Codec::Packed,
+                &[],
+                &mut behaviors
+            )
+            .unwrap(),
             BehaviorStep::Now(SimOutcome::Ok(params))
         );
     }

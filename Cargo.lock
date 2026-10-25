@@ -68,7 +68,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "comline-runtime"
 version = "0.1.0"
-source = "git+https://github.com/ComlineProject/runtime?rev=4d6e1c54303b17c6cdaefb4f5af7faa9ae9ff0d7#4d6e1c54303b17c6cdaefb4f5af7faa9ae9ff0d7"
+source = "git+https://github.com/ComlineProject/runtime?rev=6a208d78e6cca289bcca73944c0e683683fca87c#6a208d78e6cca289bcca73944c0e683683fca87c"
 dependencies = [
  "bytemuck",
  "serde",

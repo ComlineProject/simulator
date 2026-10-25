@@ -96,12 +96,19 @@ pub enum TypeDef {
         name: String,
         variants: Vec<String>,
     },
+    /// `type Name = T`: another name for `of`, the same on the wire.
+    Alias {
+        name: String,
+        of: TypeRef,
+    },
 }
 
 impl TypeDef {
     pub fn name(&self) -> &str {
         match self {
-            TypeDef::Struct { name, .. } | TypeDef::Enum { name, .. } => name,
+            TypeDef::Struct { name, .. }
+            | TypeDef::Enum { name, .. }
+            | TypeDef::Alias { name, .. } => name,
         }
     }
 }
@@ -196,6 +203,12 @@ fn zero_value_seen(ty: &TypeRef, types: &[TypeDef], seen: &mut Vec<String>) -> V
                 TypeDef::Enum { variants, .. } => variants
                     .first()
                     .map_or(Value::Null, |v| Value::String(v.clone())),
+                TypeDef::Alias { of, .. } => {
+                    seen.push(name.clone());
+                    let value = zero_value_seen(of, types, seen);
+                    seen.pop();
+                    value
+                }
                 TypeDef::Struct { fields, .. } => {
                     seen.push(name.clone());
                     let mut obj = Map::new();

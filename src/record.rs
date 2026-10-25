@@ -378,8 +378,12 @@ mod tests {
 
     /// A recording of two `send` calls on the chat session.
     fn two_call_recording() -> Recording {
+        recording_of(chat::session())
+    }
+
+    fn recording_of(session: Session) -> Recording {
         let mut r = Recorder::new();
-        r.start(&chat::session(), 0.0);
+        r.start(&session, 0.0);
         Recording {
             v: 1,
             session: r.stop().session,
@@ -421,7 +425,16 @@ mod tests {
 
     #[test]
     fn replay_applies_a_recorded_behaviour_edit() {
-        let mut rec = two_call_recording();
+        // JSON bodies, so the test can read them straight off the frames — and
+        // `echo`'s reply (the arguments) isn't a `Message`, which `packed@1`
+        // would refuse to encode.
+        let mut session = chat::session();
+        session.set_transport(
+            chat::CONN,
+            crate::model::FramingChoice::Auto,
+            crate::format::Codec::Json,
+        );
+        let mut rec = recording_of(session);
         let server_id = {
             let s = chat::session();
             s.instances

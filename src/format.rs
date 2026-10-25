@@ -4,10 +4,19 @@
 //! and `rmp-serde`.
 //!
 //! [`Codec`] is the enum the engine holds so a connection can pick a format; it
-//! implements [`WireFormat`] by dispatch.
+//! implements [`WireFormat`] by dispatch. `packed@1` puts no tags on the wire,
+//! so an untyped value needs the schema to lay it out: the engine encodes and
+//! decodes bodies with [`Codec::encode_body`] / [`Codec::decode_body`].
 
-use comline_runtime::contract::{BufMut, RuntimeError, WireFormat, FORMAT_JSON, FORMAT_MSGPACK};
+use comline_runtime::contract::{
+    BufMut, RuntimeError, WireFormat, FORMAT_JSON, FORMAT_MSGPACK, FORMAT_PACKED,
+};
+use comline_runtime::format::Packed;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::packed::{self, Body};
+use crate::shape::TypeDef;
 
 /// JSON via `serde_json`, appended straight into the frame buffer.
 pub struct Json;
@@ -62,16 +71,24 @@ impl WireFormat for MsgPack {
 #[serde(rename_all = "lowercase")]
 pub enum Codec {
     #[default]
+    Packed,
     Json,
     Msgpack,
 }
 
 impl Codec {
-    /// The short key a session link and the UI use (`json`, `msgpack`), the
-    /// same spelling [`Codec::parse`] reads. The handshake uses the versioned
-    /// [`WireFormat::name`] instead.
+    /// JSON — what a connection in a session link from before `packed@1`
+    /// speaks (its `wireFormat` key is absent).
+    pub fn json() -> Self {
+        Codec::Json
+    }
+
+    /// The short key a session link and the UI use (`packed`, `json`,
+    /// `msgpack`), the same spelling [`Codec::parse`] reads. The handshake uses
+    /// the versioned [`WireFormat::name`] instead.
     pub fn label(self) -> &'static str {
         match self {
+            Codec::Packed => "packed",
             Codec::Json => "json",
             Codec::Msgpack => "msgpack",
         }
@@ -79,16 +96,74 @@ impl Codec {
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "packed" => Some(Codec::Packed),
             "json" => Some(Codec::Json),
             "msgpack" => Some(Codec::Msgpack),
             _ => None,
         }
+    }
+
+    /// Encode a call's body, laid out as `body`. `packed@1` needs the schema's
+    /// `types` to know the layout; the self-describing formats ignore both.
+    pub fn encode_body(
+        &self,
+        value: &Value,
+        body: Body<'_>,
+        types: &[TypeDef],
+        out: &mut Vec<u8>,
+    ) -> Result<(), RuntimeError> {
+        match self {
+            Codec::Packed => packed::encode(value, body, types, out),
+            _ => self.encode(value, out),
+        }
+    }
+
+    /// Decode a call's body, laid out as `body`, into the simulator's JSON
+    /// shape. See [`Codec::encode_body`].
+    pub fn decode_body(
+        &self,
+        bytes: &[u8],
+        body: Body<'_>,
+        types: &[TypeDef],
+    ) -> Result<Value, RuntimeError> {
+        match self {
+            Codec::Packed => packed::decode(bytes, body, types),
+            _ => self.decode::<Value>(bytes),
+        }
+    }
+}
+
+/// A body already encoded by [`Codec::encode_body`], handed to a framing that
+/// wants a [`WireFormat`]: it writes the bytes as they are, under the codec's
+/// name. It can't decode anything.
+pub struct Preencoded<'a> {
+    pub name: &'static str,
+    pub bytes: &'a [u8],
+}
+
+impl WireFormat for Preencoded<'_> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn encode<T: Serialize + ?Sized>(
+        &self,
+        _value: &T,
+        out: &mut dyn BufMut,
+    ) -> Result<(), RuntimeError> {
+        out.put_slice(self.bytes);
+        Ok(())
+    }
+
+    fn decode<'de, T: Deserialize<'de>>(&self, _bytes: &'de [u8]) -> Result<T, RuntimeError> {
+        Err(RuntimeError::Serialization)
     }
 }
 
 impl WireFormat for Codec {
     fn name(&self) -> &'static str {
         match self {
+            Codec::Packed => FORMAT_PACKED,
             Codec::Json => FORMAT_JSON,
             Codec::Msgpack => FORMAT_MSGPACK,
         }
@@ -100,6 +175,7 @@ impl WireFormat for Codec {
         out: &mut dyn BufMut,
     ) -> Result<(), RuntimeError> {
         match self {
+            Codec::Packed => Packed.encode(value, out),
             Codec::Json => Json.encode(value, out),
             Codec::Msgpack => MsgPack.encode(value, out),
         }
@@ -107,6 +183,7 @@ impl WireFormat for Codec {
 
     fn decode<'de, T: Deserialize<'de>>(&self, bytes: &'de [u8]) -> Result<T, RuntimeError> {
         match self {
+            Codec::Packed => Packed.decode(bytes),
             Codec::Json => Json.decode(bytes),
             Codec::Msgpack => MsgPack.decode(bytes),
         }
@@ -143,10 +220,32 @@ mod tests {
 
     #[test]
     fn codec_round_trips_through_lowercase_json() {
-        for c in [Codec::Json, Codec::Msgpack] {
+        for c in [Codec::Packed, Codec::Json, Codec::Msgpack] {
             let s = serde_json::to_string(&c).unwrap();
+            assert_eq!(s, format!("\"{}\"", c.label()));
             assert_eq!(serde_json::from_str::<Codec>(&s).unwrap(), c);
             assert_eq!(Codec::parse(c.label()), Some(c));
         }
+        assert_eq!(Codec::parse("nope"), None);
+    }
+
+    #[test]
+    fn packed_is_the_default() {
+        assert_eq!(Codec::default(), Codec::Packed);
+        assert_eq!(Codec::default().name(), FORMAT_PACKED);
+        assert_eq!(Codec::json(), Codec::Json);
+    }
+
+    #[test]
+    fn preencoded_writes_its_bytes_as_they_are() {
+        let p = Preencoded {
+            name: FORMAT_PACKED,
+            bytes: &[1, 2, 3],
+        };
+        let mut out = Vec::new();
+        p.encode(&"ignored", &mut out).unwrap();
+        assert_eq!(out, [1, 2, 3]);
+        assert_eq!(p.name(), FORMAT_PACKED);
+        assert!(p.decode::<Value>(&out).is_err());
     }
 }
