@@ -25,6 +25,7 @@ fn string() -> TypeRef {
 /// `send(text: string) -> Message`, or (oneway) `note(text: string)`.
 pub fn fn_shape(name: &str, index: u32, oneway: bool) -> FnShape {
     FnShape {
+        call: None,
         name: name.into(),
         index,
         oneway,
@@ -62,10 +63,12 @@ pub fn message_type() -> TypeDef {
 /// `Message` type, and a given IR hash (tests vary the hash to exercise skew).
 pub fn shape_with(functions: Vec<FnShape>, ir_hash: &str) -> ProjectShape {
     ProjectShape {
+        connection: None,
         schemas: vec![SchemaShape {
             namespace: "chat".into(),
             ir_hash: ir_hash.into(),
             protocols: vec![ProtocolShape {
+                number: None,
                 name: "Chat".into(),
                 framing: Framing::Datagram2,
                 functions,

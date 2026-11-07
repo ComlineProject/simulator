@@ -15,7 +15,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use comline_runtime::contract::{Envelope, HandshakeFrame, RuntimeError, WireFormat};
+use comline_runtime::comline2::{Comline2, Exchange, Message, Negotiated, Params, Refusal};
+use comline_runtime::contract::{Envelope, HandshakeFrame, RuntimeError, Side, WireFormat};
 use serde_json::{json, Value};
 
 use crate::behavior::{BehaviorKind, BehaviorStep, SimOutcome};
@@ -116,6 +117,11 @@ struct Wire {
     /// Set once a call has timed out — the client half is desynced, every later
     /// call fails fast until the connection is reopened.
     dead: bool,
+    /// Under `comline@2`: what the client end agreed, which says which calls
+    /// it may send (`degrade` fails a call the server lacks locally).
+    negotiated: Option<Negotiated>,
+    /// The number the protocol's frames carry on this connection.
+    protocol_number: u16,
 }
 
 impl Wire {
@@ -300,19 +306,61 @@ impl Engine {
                 ShapeFraming::Jsonrpc => WireFraming::Jsonrpc,
                 ShapeFraming::Datagram => WireFraming::Datagram,
                 ShapeFraming::Datagram2 => WireFraming::Datagram2(number),
+                ShapeFraming::Datagram3 => WireFraming::Datagram3(number),
             },
             FramingChoice::Datagram => WireFraming::Datagram,
             FramingChoice::Datagram2 => WireFraming::Datagram2(number),
+            FramingChoice::Datagram3 => WireFraming::Datagram3(number),
             FramingChoice::Jsonrpc => WireFraming::Jsonrpc,
         };
         let codec = conn.wire_format;
         let bad_combo = framing == WireFraming::Jsonrpc && codec != Codec::Json;
 
+        // `comline@2`, when the package runs it on a connection framing and
+        // both ends carry a `Hello`: the runtime's own exchange, each message
+        // a frame, judged by its rules (a stale end may still connect,
+        // degraded, or be refused with a reason).
+        let comline2 = match (&client.hello, &server.hello, framing) {
+            (Some(c), Some(s), WireFraming::Datagram2(_) | WireFraming::Datagram3(_)) => {
+                let params = session
+                    .shape
+                    .connection
+                    .as_ref()
+                    .and_then(|c| serde_json::to_value(&c.params).ok())
+                    .and_then(|p| serde_json::from_value::<Params>(p).ok())
+                    .unwrap_or_default();
+                Some(comline2_exchange(params, c, s))
+            }
+            _ => None,
+        };
+        let mut negotiated = None;
+
         // Handshake: record a frame each way (the inspector shows them) and
         // refuse on a mismatch. The two ends always agree on codec + framing, so
         // only the IR hash can disagree — the version-skew demo. A partition
         // cuts the handshake too → also a refusal.
-        let error = {
+        let error = if let Some(exchange) = comline2 {
+            let mut cut = false;
+            for (dir, message) in &exchange.messages {
+                cut |= matches!(
+                    channel.send(*dir, message, 0.0, &mut self.rng),
+                    SendOutcome::Dropped
+                );
+            }
+            if bad_combo {
+                Some("json-rpc framing requires the json codec".to_string())
+            } else if cut {
+                Some("handshake".to_string())
+            } else {
+                match exchange.result {
+                    Ok(agreed) => {
+                        negotiated = Some(agreed);
+                        None
+                    }
+                    Err(r) => Some(refusal_text(&r)),
+                }
+            }
+        } else {
             let c_hs = handshake_frame(&client.ir_hash, codec.name(), framing.name());
             let s_hs = handshake_frame(&server.ir_hash, codec.name(), framing.name());
             let c = channel.send(Direction::Request, &c_hs, 0.0, &mut self.rng);
@@ -348,6 +396,8 @@ impl Engine {
             error,
             timeout_ms: session.call_timeout_ms.max(0.0),
             dead: false,
+            negotiated,
+            protocol_number: number,
         }
     }
 
@@ -487,7 +537,12 @@ impl Engine {
             .enumerate()
             .find(|(_, f)| f.name == fn_name)
             .ok_or(RuntimeError::UnknownCall)?;
-        let call_id = function.index as u16;
+        let call_id = function.call_id();
+        // `comline@2`'s `degrade`: a call the server lacks fails here, and
+        // never reaches the wire.
+        if let Some(negotiated) = &wire.negotiated {
+            negotiated.check_call(wire.protocol_number, call_id)?;
+        }
         let one_way = function.oneway;
         let timeout_ms = wire.timeout_ms;
 
@@ -843,7 +898,10 @@ fn build_behaviors(server: &Instance, proto: &ProtocolShape, schema: &SchemaShap
 
 /// The framing / codec combinations the compare panel runs (2g). JSON-RPC pairs
 /// only with JSON.
-pub const TRANSPORT_MATRIX: [(FramingChoice, Codec); 7] = [
+pub const TRANSPORT_MATRIX: [(FramingChoice, Codec); 10] = [
+    (FramingChoice::Datagram3, Codec::Packed),
+    (FramingChoice::Datagram3, Codec::Json),
+    (FramingChoice::Datagram3, Codec::Msgpack),
     (FramingChoice::Datagram2, Codec::Packed),
     (FramingChoice::Datagram2, Codec::Json),
     (FramingChoice::Datagram2, Codec::Msgpack),
@@ -894,8 +952,122 @@ fn framing_label(f: FramingChoice) -> &'static str {
     match f {
         FramingChoice::Jsonrpc => "jsonrpc",
         FramingChoice::Datagram2 => "datagram@2",
+        FramingChoice::Datagram3 => "datagram@3",
         _ => "datagram",
     }
+}
+
+/// A `comline@2` exchange between a client and a server, run to its end.
+struct Comline2Exchange {
+    /// Each message, in the order sent, with its direction.
+    messages: Vec<(Direction, Vec<u8>)>,
+    /// What the client end agreed, or why the connection was refused.
+    result: Result<Negotiated, Refusal>,
+}
+
+/// Run `comline@2` between a client sending the `Hello` `client` (hex) and a
+/// server sending `server`, both with `params`, through the runtime's sans-IO
+/// [`Comline2`]: `offer` (the client offers, the server answers, the client
+/// gives its verdict) or `symmetric` (both send a `Hello` and a verdict).
+fn comline2_exchange(params: Params, client: &str, server: &str) -> Comline2Exchange {
+    let end = |hex: &str| -> Option<Comline2> {
+        let bytes = from_hex(hex)?;
+        match Message::decode(&bytes).ok()? {
+            Message::Hello(hello) => Some(Comline2::new(params, hello)),
+            _ => None,
+        }
+    };
+    let (Some(c), Some(s)) = (end(client), end(server)) else {
+        return Comline2Exchange {
+            messages: vec![],
+            result: Err(Refusal {
+                reason: comline_runtime::contract::Reason::Malformed,
+                side: Side::Initiator,
+                protocol: None,
+            }),
+        };
+    };
+    let mut messages = vec![];
+    let c_hello = c.hello_message().to_bytes();
+    messages.push((Direction::Request, c_hello.clone()));
+    let result = match params.exchange {
+        Exchange::Offer => {
+            let answer = s.answer_offer(&c_hello);
+            let answer_bytes = answer
+                .reply
+                .as_ref()
+                .map(Message::to_bytes)
+                .unwrap_or_default();
+            messages.push((Direction::Response, answer_bytes.clone()));
+            let concluded = c.conclude_answer(&answer_bytes);
+            let verdict = concluded.reply.as_ref().map(Message::to_bytes);
+            if let Some(verdict) = &verdict {
+                messages.push((Direction::Request, verdict.clone()));
+            }
+            match (answer.result, concluded.result, verdict) {
+                (Err(r), _, _) | (_, Err(r), _) => Err(r),
+                (Ok(server_agreed), Ok(client_agreed), Some(verdict)) => {
+                    Comline2::finish(Side::Responder, server_agreed, &verdict)
+                        .map(|_| client_agreed)
+                }
+                (Ok(_), Ok(client_agreed), None) => Ok(client_agreed),
+            }
+        }
+        Exchange::Symmetric => {
+            let s_hello = s.hello_message().to_bytes();
+            messages.push((Direction::Response, s_hello.clone()));
+            let c_step = c.judge_hello(Side::Initiator, &s_hello);
+            let s_step = s.judge_hello(Side::Responder, &c_hello);
+            let c_verdict = c_step
+                .reply
+                .as_ref()
+                .map(Message::to_bytes)
+                .unwrap_or_default();
+            let s_verdict = s_step
+                .reply
+                .as_ref()
+                .map(Message::to_bytes)
+                .unwrap_or_default();
+            messages.push((Direction::Request, c_verdict.clone()));
+            messages.push((Direction::Response, s_verdict.clone()));
+            match (c_step.result, s_step.result) {
+                (Ok(c_agreed), Ok(s_agreed)) => {
+                    Comline2::finish(Side::Responder, s_agreed, &c_verdict)
+                        .and_then(|_| Comline2::finish(Side::Initiator, c_agreed, &s_verdict))
+                }
+                (Err(r), _) | (_, Err(r)) => Err(r),
+            }
+        }
+    };
+    Comline2Exchange { messages, result }
+}
+
+/// A `comline@2` refusal as the connection's error: `handshake`, then why
+/// and which end refused, as the runtime reports it.
+fn refusal_text(r: &Refusal) -> String {
+    let reason = serde_json::to_value(r.reason)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{:?}", r.reason));
+    let side = match r.side {
+        Side::Initiator => "client",
+        Side::Responder => "server",
+    };
+    match r.protocol {
+        Some(p) => format!("handshake: {reason} on protocol {p}, refused by the {side}"),
+        None => format!("handshake: {reason}, refused by the {side}"),
+    }
+}
+
+/// `"0a1b..."` as bytes; `None` for anything that isn't hex.
+fn from_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 /// A 31-byte handshake frame carrying the instance's IR hash and the connection's
@@ -1421,7 +1593,7 @@ mod tests {
     fn compare_transports_agrees_on_the_body_and_differs_on_the_frames() {
         let session = chat::session();
         let runs = compare_transports(&session, chat::CONN, "send", &json!(["hi"]));
-        assert_eq!(runs.len(), 7);
+        assert_eq!(runs.len(), 10);
 
         // every combo decodes to the same reply
         for run in &runs {
@@ -1462,6 +1634,12 @@ mod tests {
         // call frame.
         assert_eq!(dg2_json.len(), dg_json.len() + 2);
         assert_eq!(&dg2_json[2..], &dg_json[..]);
+        // datagram@3 writes the kind, the protocol number and the function's
+        // wire number as varints, where datagram's call id is a `u16`.
+        let dg3_json = req_bytes("datagram@3/json");
+        assert_eq!(dg3_json.len(), dg_json.len() + 1);
+        assert_eq!(dg3_json[0], 0, "a request");
+        assert_eq!(&dg3_json[3..], &dg_json[2..]);
         assert!(std::str::from_utf8(&rpc)
             .unwrap()
             .contains("\"method\":\"send\""));
@@ -1602,5 +1780,153 @@ mod tests {
             e.connection_error(chat::CONN),
             Some("json-rpc framing requires the json codec")
         );
+    }
+
+    /// A `comline@2` `Hello` for the `chat` package, hex: protocol 0 at line
+    /// 0.1.0 with `shape`, functions `functions`.
+    fn chat_hello(shape: u8, functions: &[u16]) -> String {
+        use comline_runtime::comline2::{
+            Encoding, EncodingKind, Hash128, Hello, PackageVersion, Protocol, Release,
+        };
+        let hello = Hello {
+            exchange: Exchange::Offer,
+            package_id: Hash128([7; 16]),
+            version: PackageVersion::release(0, 1, 0),
+            encodings: vec![
+                Encoding {
+                    kind: EncodingKind::Format,
+                    param_hash: Hash128([1; 16]),
+                },
+                Encoding {
+                    kind: EncodingKind::Framing,
+                    param_hash: Hash128([2; 16]),
+                },
+                Encoding {
+                    kind: EncodingKind::Handshake,
+                    param_hash: Hash128([3; 16]),
+                },
+            ],
+            protocols: vec![Protocol {
+                number: 0,
+                line: Release::new(0, 1, 0),
+                shape_hash: Hash128([shape; 16]),
+                functions: functions.to_vec(),
+            }],
+        };
+        Message::Hello(hello)
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// The `chat` session on `datagram@3` and `comline@2`, `send` at wire
+    /// number 5 (not its position), both ends sending `hello`.
+    fn comline2_session(params: &[(&str, &str)], hello: &str) -> Session {
+        let mut session = chat::session();
+        let mut shape = session.shape.clone();
+        let proto = &mut shape.schemas[0].protocols[0];
+        proto.framing = ShapeFraming::Datagram3;
+        proto.number = Some(0);
+        proto.functions[0].call = Some(5);
+        shape.connection = Some(crate::shape::ConnectionShape {
+            framing: "datagram@3".into(),
+            handshake: "comline@2".into(),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            hello: Some(hello.to_string()),
+        });
+        session.rebuild(shape);
+        let ids: Vec<String> = session.instances.iter().map(|i| i.id.clone()).collect();
+        for id in ids {
+            session.resync_instance(&id);
+        }
+        session
+    }
+
+    #[test]
+    fn comline2_on_datagram3_handshakes_through_the_runtime_and_calls_by_number() {
+        let session = comline2_session(&[], &chat_hello(9, &[5]));
+        let mut e = Engine::new();
+        e.sync(&session);
+        assert_eq!(e.connection_error(CONN), None);
+        let id = e.call(CONN, "send", &json!(["hi"])).unwrap();
+        e.run();
+        assert_eq!(e.result(id), Some(&CallResult::Ok(hello())));
+
+        let frames = &e.tap(CONN).unwrap().frames;
+        let handshakes: Vec<&[u8]> = frames
+            .iter()
+            .filter(|f| f.kind == FrameKind::Handshake)
+            .map(|f| f.bytes.as_slice())
+            .collect();
+        assert_eq!(handshakes.len(), 3, "hello, answer, verdict under `offer`");
+        for bytes in &handshakes {
+            assert!(bytes.starts_with(&[0x43, 0x4f, 2]), "{bytes:?}");
+        }
+        let request = frames
+            .iter()
+            .find(|f| f.kind == FrameKind::Request)
+            .unwrap();
+        assert_eq!(
+            &request.bytes[..3],
+            &[0, 0, 5],
+            "kind, protocol 0, function 5"
+        );
+    }
+
+    #[test]
+    fn comline2_symmetric_sends_two_hellos_and_two_verdicts() {
+        let session = comline2_session(&[("exchange", "symmetric")], &chat_hello(9, &[5]));
+        let mut e = Engine::new();
+        e.sync(&session);
+        assert_eq!(e.connection_error(CONN), None);
+        let shaken = e
+            .tap(CONN)
+            .unwrap()
+            .frames
+            .iter()
+            .filter(|f| f.kind == FrameKind::Handshake)
+            .count();
+        assert_eq!(shaken, 4);
+    }
+
+    #[test]
+    fn a_stale_comline2_end_is_judged_by_its_rules() {
+        // The server was placed before an edit: same version, another shape.
+        let mut session = comline2_session(&[], &chat_hello(9, &[5]));
+        let server = session
+            .instances
+            .iter()
+            .position(|i| i.role == Role::Server)
+            .unwrap();
+        session.instances[server].hello = Some(chat_hello(8, &[5]));
+        let mut e = Engine::new();
+        e.sync(&session);
+        assert_eq!(
+            e.connection_error(CONN),
+            Some("handshake: same_version_differs on protocol 0, refused by the server")
+        );
+
+        // Under `warn` it connects, and a function the server lacks fails
+        // locally (`degrade`), never reaching the wire.
+        let mut session =
+            comline2_session(&[("same_version_differs", "warn")], &chat_hello(9, &[5]));
+        session.instances[server].hello = Some(chat_hello(8, &[]));
+        let mut e = Engine::new();
+        e.sync(&session);
+        assert_eq!(e.connection_error(CONN), None);
+        assert_eq!(
+            e.call(CONN, "send", &json!(["hi"])),
+            Err(RuntimeError::Unavailable)
+        );
+        assert!(!e
+            .tap(CONN)
+            .unwrap()
+            .frames
+            .iter()
+            .any(|f| f.kind == FrameKind::Request));
     }
 }

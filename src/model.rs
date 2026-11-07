@@ -60,6 +60,11 @@ pub struct Instance {
     /// rejects (the version-skew demo). [`Session::resync_instance`] snaps it
     /// forward.
     pub ir_hash: String,
+    /// Under `comline@2`: the `Hello` this instance sends, hex, kept like
+    /// [`Instance::ir_hash`] from when it was placed or last resynced, so a
+    /// stale instance's handshake is judged by `comline@2`'s own rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hello: Option<String>,
     /// The canvas node hosting this instance.
     pub node_id: String,
 }
@@ -86,6 +91,8 @@ pub enum FramingChoice {
     Datagram,
     #[serde(rename = "datagram@2")]
     Datagram2,
+    #[serde(rename = "datagram@3")]
+    Datagram3,
     Jsonrpc,
 }
 
@@ -95,6 +102,7 @@ impl FramingChoice {
             "auto" => Some(FramingChoice::Auto),
             "datagram" => Some(FramingChoice::Datagram),
             "datagram@2" => Some(FramingChoice::Datagram2),
+            "datagram@3" => Some(FramingChoice::Datagram3),
             "jsonrpc" => Some(FramingChoice::Jsonrpc),
             _ => None,
         }
@@ -242,6 +250,7 @@ impl Session {
         let ir_hash = find_protocol(&self.shape, &spec.schema_ns, &spec.protocol)
             .map(|(schema, _)| schema.ir_hash.clone())
             .unwrap_or_else(|| "0x0".to_string());
+        let hello = self.shape.comline2_hello().map(str::to_string);
 
         let node_id = match place
             .node_id
@@ -275,6 +284,7 @@ impl Session {
             protocol: spec.protocol,
             behaviors,
             ir_hash,
+            hello,
             node_id,
         });
         id
@@ -478,8 +488,10 @@ impl Session {
             find_protocol(&self.shape, &inst.schema_ns, &inst.protocol)
                 .map(|(schema, _)| schema.ir_hash.clone())
         });
+        let hello = self.shape.comline2_hello().map(str::to_string);
         if let (Some(hash), Some(inst)) = (hash, self.instance_mut(id)) {
             inst.ir_hash = hash;
+            inst.hello = hello;
         }
     }
 
@@ -696,7 +708,10 @@ mod tests {
         s.add_instance(spec(Role::Client), Placement::default());
 
         // a shape with no `chat` schema at all
-        s.rebuild(ProjectShape { schemas: vec![] });
+        s.rebuild(ProjectShape {
+            schemas: vec![],
+            connection: None,
+        });
         assert!(s.instances.is_empty());
         assert!(s.nodes.is_empty(), "emptied boxes are pruned");
         assert!(s.instance(&srv).is_none());
@@ -743,6 +758,7 @@ mod tests {
     fn reseed_counters_lifts_past_loaded_ids() {
         let mut s = base_session();
         s.instances.push(Instance {
+            hello: None,
             id: "i7".into(),
             name: "chat-1".into(),
             role: Role::Server,

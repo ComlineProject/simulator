@@ -71,10 +71,7 @@ impl GenericDispatch {
 
     fn resolve(&self, call: RequestCall<'_>) -> Option<usize> {
         match call {
-            RequestCall::Id(id) => {
-                let idx = id as usize;
-                (idx < self.proto.functions.len()).then_some(idx)
-            }
+            RequestCall::Id(id) => self.proto.functions.iter().position(|f| f.call_id() == id),
             RequestCall::Name(name) => self.proto.functions.iter().position(|f| f.name == name),
         }
     }

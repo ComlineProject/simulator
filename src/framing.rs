@@ -1,5 +1,6 @@
 //! The framings a connection can speak, all of them `comline-runtime`'s:
-//! `DatagramFraming`, `Datagram2Framing` and `JsonRpcFraming`. The simulator
+//! `DatagramFraming`, `Datagram2Framing`, `Datagram3Framing` and
+//! `JsonRpcFraming`. The simulator
 //! frames and parses through them, so its frames are the runtime's, byte for
 //! byte.
 //!
@@ -16,8 +17,8 @@
 //! framings only write the id they're given.
 
 use comline_runtime::contract::{
-    ConnectionFraming, Datagram2Framing, DatagramFraming, Envelope, Frame, Framing, ProtocolNumber,
-    Request,
+    ConnectionFraming, Datagram2Framing, Datagram3Framing, DatagramFraming, Envelope, Frame,
+    Framing, ProtocolNumber, Request,
 };
 use comline_runtime::framing::JsonRpcFraming;
 
@@ -25,9 +26,13 @@ use comline_runtime::framing::JsonRpcFraming;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireFraming {
     Datagram,
-    /// `datagram@2`, the default: every frame carries its kind and the
-    /// protocol's number on the connection.
+    /// `datagram@2`: every frame carries its kind and the protocol's number
+    /// on the connection.
     Datagram2(ProtocolNumber),
+    /// `datagram@3`, the default: `datagram@2` with a request addressed by
+    /// wire numbers, the protocol's and the function's, as varints. Replies
+    /// are `datagram@2`'s.
+    Datagram3(ProtocolNumber),
     /// JSON-RPC 2.0, as a lockstep `Client` speaks it: the simulator's
     /// JSON-RPC protocols are all provided by the server, and the Rust
     /// generator puts such a package on a `Client`, not a `Connection`. So
@@ -41,6 +46,7 @@ impl WireFraming {
         match self {
             WireFraming::Datagram => comline_runtime::contract::FRAMING_DATAGRAM,
             WireFraming::Datagram2(_) => comline_runtime::contract::FRAMING_DATAGRAM2,
+            WireFraming::Datagram3(_) => comline_runtime::contract::FRAMING_DATAGRAM3,
             WireFraming::Jsonrpc => comline_runtime::contract::FRAMING_JSONRPC,
         }
     }
@@ -79,6 +85,16 @@ impl WireFraming {
                 body,
                 out,
             ),
+            WireFraming::Datagram3(protocol) => ConnectionFraming::encode_request_body(
+                &Datagram3Framing,
+                protocol,
+                call_id,
+                call_name,
+                request_id,
+                one_way,
+                body,
+                out,
+            ),
             WireFraming::Jsonrpc => Framing::encode_request_body(
                 &JsonRpcFraming,
                 call_id,
@@ -97,6 +113,10 @@ impl WireFraming {
                 Frame::Request { request, .. } => Some(request),
                 Frame::Reply { .. } => None,
             },
+            WireFraming::Datagram3(_) => match Datagram3Framing.decode(frame)? {
+                Frame::Request { request, .. } => Some(request),
+                Frame::Reply { .. } => None,
+            },
             WireFraming::Jsonrpc => Framing::decode_request(&JsonRpcFraming, frame),
         }
     }
@@ -104,7 +124,7 @@ impl WireFraming {
     pub fn encode_response_ok(self, request_id: u64, payload: &[u8], out: &mut Vec<u8>) {
         match self {
             WireFraming::Datagram => DatagramFraming.encode_response_ok(request_id, payload, out),
-            WireFraming::Datagram2(protocol) => {
+            WireFraming::Datagram2(protocol) | WireFraming::Datagram3(protocol) => {
                 Datagram2Framing.encode_reply(protocol, request_id, &Envelope::Ok(payload), out)
             }
             WireFraming::Jsonrpc => JsonRpcFraming.encode_response_ok(request_id, payload, out),
@@ -114,12 +134,8 @@ impl WireFraming {
     pub fn encode_response_err(self, request_id: u64, id: u16, body: &[u8], out: &mut Vec<u8>) {
         match self {
             WireFraming::Datagram => DatagramFraming.encode_response_err(request_id, id, body, out),
-            WireFraming::Datagram2(protocol) => Datagram2Framing.encode_reply(
-                protocol,
-                request_id,
-                &Envelope::Err { id, body },
-                out,
-            ),
+            WireFraming::Datagram2(protocol) | WireFraming::Datagram3(protocol) => Datagram2Framing
+                .encode_reply(protocol, request_id, &Envelope::Err { id, body }, out),
             WireFraming::Jsonrpc => JsonRpcFraming.encode_response_err(request_id, id, body, out),
         }
     }
@@ -130,7 +146,7 @@ impl WireFraming {
     pub fn encode_response_fault(self, request_id: u64, out: &mut Vec<u8>) {
         match self {
             WireFraming::Datagram => DatagramFraming.encode_response_fault(request_id, out),
-            WireFraming::Datagram2(protocol) => {
+            WireFraming::Datagram2(protocol) | WireFraming::Datagram3(protocol) => {
                 Datagram2Framing.encode_reply(protocol, request_id, &Envelope::Fault, out)
             }
             WireFraming::Jsonrpc => JsonRpcFraming.encode_response_fault(request_id, out),
@@ -140,14 +156,16 @@ impl WireFraming {
     pub fn decode_response<'f>(self, frame: &'f [u8]) -> Option<(u64, Envelope<'f>)> {
         match self {
             WireFraming::Datagram => DatagramFraming.decode_response(frame),
-            WireFraming::Datagram2(_) => match Datagram2Framing.decode(frame)? {
-                Frame::Reply {
-                    request_id,
-                    envelope,
-                    ..
-                } => Some((request_id, envelope)),
-                Frame::Request { .. } => None,
-            },
+            WireFraming::Datagram2(_) | WireFraming::Datagram3(_) => {
+                match Datagram2Framing.decode(frame)? {
+                    Frame::Reply {
+                        request_id,
+                        envelope,
+                        ..
+                    } => Some((request_id, envelope)),
+                    Frame::Request { .. } => None,
+                }
+            }
             WireFraming::Jsonrpc => JsonRpcFraming.decode_response(frame),
         }
     }

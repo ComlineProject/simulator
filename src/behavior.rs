@@ -553,6 +553,7 @@ mod tests {
         errors: Vec<crate::shape::ErrorShape>,
     ) -> (SchemaShape, ProtocolShape) {
         let proto = ProtocolShape {
+            number: None,
             name: "P".into(),
             framing: Framing::Datagram,
             functions,
@@ -569,6 +570,7 @@ mod tests {
 
     fn fn_send() -> FnShape {
         FnShape {
+            call: None,
             name: "send".into(),
             index: 0,
             oneway: false,
