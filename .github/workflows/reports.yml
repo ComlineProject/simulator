@@ -1,0 +1,88 @@
+name: Reports
+
+# Size report for the Observatory: the wasm build, before and after wasm-opt,
+# in the lean (no scripting) and the scripted flavour. On every push to `main`
+# (and a manual run) it's committed to the `reports` branch; elsewhere the
+# publish is a dry run.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reports-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Rust toolchain
+        id: rust
+        run: |
+          rustup update stable && rustup default stable && rustup target add wasm32-unknown-unknown
+          echo "version=$(rustc --version)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo + installed tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.lock') }}
+
+      - name: wasm-bindgen CLI (matched to the crate)
+        run: |
+          wb=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          wasm-bindgen --version 2>/dev/null | grep -qx "wasm-bindgen $wb" \
+            || cargo install wasm-bindgen-cli --version "=$wb" --locked
+
+      - name: wasm-opt
+        run: command -v wasm-opt || (sudo apt-get update -qq && sudo apt-get install -y -qq binaryen)
+
+      - name: Build (optimized)
+        run: |
+          scripts/build-wasm.sh pkg-script comline_simulator
+          scripts/build-wasm.sh pkg        comline_simulator --no-default-features
+
+      - name: Bindgen output before wasm-opt
+        run: |
+          for f in "" "--no-default-features"; do
+            cargo build --release --target wasm32-unknown-unknown $f
+            out=raw$([ -n "$f" ] && echo -lean || echo -script)
+            wasm-bindgen --target web --out-dir "$out" --out-name comline_simulator \
+              target/wasm32-unknown-unknown/release/comline_simulator.wasm
+          done
+
+      - uses: ComlineProject/observatory/.github/actions/report-size@v1
+        with:
+          output: simulator.size.json
+          toolchain: ${{ steps.rust.outputs.version }}
+          artifacts: |
+            simulator/wasm32-opt=pkg/comline_simulator_bg.wasm
+            simulator/wasm32=raw-lean/comline_simulator_bg.wasm
+            simulator/wasm32-script-opt=pkg-script/comline_simulator_bg.wasm
+            simulator/wasm32-script=raw-script/comline_simulator_bg.wasm
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: simulator.size.json
+          path: simulator.size.json
+      - uses: ComlineProject/observatory/.github/actions/publish-report@v1
+        with:
+          reports: simulator.size.json
+          readme: .github/reports-branch.md
+          dry-run: ${{ github.ref != 'refs/heads/main' }}
