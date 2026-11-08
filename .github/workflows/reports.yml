@@ -7,6 +7,9 @@ name: Reports
 
 on:
   pull_request:
+    paths:
+      - '.github/workflows/reports.yml'
+      - 'scripts/build-wasm.sh'
   push:
     branches: [main]
   workflow_dispatch:
