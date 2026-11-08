@@ -12,6 +12,36 @@ use serde_json::{Map, Value};
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ProjectShape {
     pub schemas: Vec<SchemaShape>,
+    /// The package's connection, when its protocols run on one. Absent from
+    /// a shape built before the editor described it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<ConnectionShape>,
+}
+
+/// The package's connection: what every protocol on it shares.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ConnectionShape {
+    /// Canonical: `datagram@3`, `datagram@2`, ...
+    pub framing: String,
+    /// Canonical: `comline@2`, `comline@1` or `none`.
+    pub handshake: String,
+    /// `comline@2`'s four parameters, each as written or its default.
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
+    /// Under `comline@2`: the encoded `Hello` this package's ends send, hex,
+    /// as the generators embed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hello: Option<String>,
+}
+
+impl ProjectShape {
+    /// The `comline@2` `Hello` the package's ends send, hex, when its
+    /// connection runs `comline@2`.
+    pub fn comline2_hello(&self) -> Option<&str> {
+        let c = self.connection.as_ref()?;
+        (c.handshake == "comline@2").then_some(())?;
+        c.hello.as_deref()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -32,9 +62,12 @@ pub struct SchemaShape {
 #[serde(rename_all = "lowercase")]
 pub enum Framing {
     Datagram,
-    /// The default: a connection, where either end can call.
+    /// A connection, where either end can call.
     #[serde(rename = "datagram@2")]
     Datagram2,
+    /// The default: `datagram@2`, with a call addressed by wire numbers.
+    #[serde(rename = "datagram@3")]
+    Datagram3,
     Jsonrpc,
 }
 
@@ -42,19 +75,35 @@ pub enum Framing {
 pub struct ProtocolShape {
     pub name: String,
     pub framing: Framing,
+    /// The number its frames carry on the connection, as the generators
+    /// address it: its wire number under `datagram@3`, else its position.
+    /// Absent: worked out by position ([`protocol_number`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u16>,
     pub functions: Vec<FnShape>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct FnShape {
     pub name: String,
-    /// 0-based position in the protocol — the `Call` id resolution matches.
+    /// 0-based position in the protocol.
     pub index: u32,
+    /// What its call carries on the wire: its wire number under `datagram@3`,
+    /// else its position. Absent: its position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<u16>,
     /// No return at all — a fire-and-forget `notify`.
     pub oneway: bool,
     pub args: Vec<ArgShape>,
     pub returns: Option<TypeRef>,
     pub throws: Vec<ThrowShape>,
+}
+
+impl FnShape {
+    /// What a call to it carries: [`FnShape::call`], else its position.
+    pub fn call_id(&self) -> u16 {
+        self.call.unwrap_or(self.index as u16)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -147,10 +196,14 @@ pub fn find_protocol<'a>(
     Some((schema, protocol))
 }
 
-/// The number protocol `name` of schema `ns` carries on a datagram@2
-/// connection: its position among every protocol in the project, schemas in
-/// order, as the generators number it. 0 for one that isn't there.
+/// The number protocol `name` of schema `ns` carries on a datagram@2 or
+/// datagram@3 connection: the one the editor described, else its position
+/// among every protocol in the project, schemas in order, as the generators
+/// number it. 0 for one that isn't there.
 pub fn protocol_number(shape: &ProjectShape, ns: &str, name: &str) -> u16 {
+    if let Some(number) = find_protocol(shape, ns, name).and_then(|(_, p)| p.number) {
+        return number;
+    }
     shape
         .schemas
         .iter()
@@ -464,6 +517,7 @@ mod tests {
     #[test]
     fn protocols_are_numbered_across_the_whole_project() {
         let protocol = |name: &str| ProtocolShape {
+            number: None,
             name: name.into(),
             framing: Framing::Datagram2,
             functions: vec![],
@@ -476,6 +530,7 @@ mod tests {
             types: vec![],
         };
         let shape = ProjectShape {
+            connection: None,
             schemas: vec![
                 schema("game", vec![protocol("Account"), protocol("Player")]),
                 schema("items", vec![protocol("Inventory")]),

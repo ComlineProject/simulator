@@ -11,12 +11,12 @@ repository = "https://github.com/ComlineProject/simulator"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# The real runtime contract — framing (datagram@1, datagram@2, JSON-RPC),
+# The real runtime contract — framing (datagram@1, @2, @3, JSON-RPC),
 # envelope, handshake, dispatch, wire format. Not `std`: it pulls
 # `libloading` (dylib), which won't build for wasm32. `jsonrpc` brings the
 # JSON-RPC framing without `std`. The simulator supplies its own codecs,
 # tapped transport and pump on top of these.
-comline-runtime = { git = "https://github.com/ComlineProject/runtime", rev = "207b38a670766f73afd155a87caa372caf9e8aa5", default-features = false, features = ["alloc", "jsonrpc"] }
+comline-runtime = { git = "https://github.com/ComlineProject/runtime", rev = "4f582f19ff02d8c0ad30426a0bdb0f586ef6f0b9", default-features = false, features = ["alloc", "jsonrpc"] }
 
 serde = { version = "1", features = ["derive"] }
 # `float_roundtrip`: read every `f64` back exactly, not one ulp off (the

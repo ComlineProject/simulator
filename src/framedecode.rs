@@ -47,6 +47,10 @@ pub struct FrameDetail {
     /// handshake: the fields it carries (names resolved where known).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handshake: Option<HandshakeDetail>,
+    /// handshake under `comline@2`: the message, as the runtime decodes it
+    /// (`{ "type": "hello" | "answer" | "verdict", "message": ... }`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comline2: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,6 +113,7 @@ impl FrameDetail {
             fault: false,
             note: None,
             handshake: None,
+            comline2: None,
         }
     }
 }
@@ -121,6 +126,7 @@ fn name_of(hash: u64) -> String {
         comline_runtime::contract::FORMAT_PACKED,
         WireFraming::Datagram.name(),
         WireFraming::Datagram2(0).name(),
+        WireFraming::Datagram3(0).name(),
         WireFraming::Jsonrpc.name(),
     ] {
         if name_hash(name) == hash {
@@ -181,6 +187,14 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
         }
     }
 
+    if bytes.starts_with(&[0x43, 0x4f, 2]) {
+        if let Ok(message) = comline_runtime::comline2::Message::decode(bytes) {
+            let mut d = FrameDetail::bare("handshake", ctx.framing.name().to_string());
+            d.comline2 = serde_json::to_value(&message).ok();
+            return d;
+        }
+    }
+
     let framing = ctx.framing;
     let name = framing.name().to_string();
     let jsonrpc = framing.is_named();
@@ -189,17 +203,15 @@ pub fn describe_frame(frame: &Frame, ctx: &DecodeCtx<'_>) -> FrameDetail {
         let Some(req) = framing.decode_request(bytes) else {
             return FrameDetail::bare("unknown", name);
         };
+        let shape = match req.call {
+            RequestCall::Id(id) => ctx.functions.iter().find(|f| f.call_id() == id),
+            RequestCall::Name(n) => ctx.functions.iter().find(|f| f.name == n),
+        };
         let function = match req.call {
-            RequestCall::Id(id) => ctx
-                .fn_names
-                .get(id as usize)
-                .map(|s| s.to_string())
+            RequestCall::Id(id) => shape
+                .map(|f| f.name.clone())
                 .unwrap_or_else(|| format!("#{id}")),
             RequestCall::Name(n) => n.to_string(),
-        };
-        let shape = match req.call {
-            RequestCall::Id(id) => ctx.functions.get(id as usize),
-            RequestCall::Name(n) => ctx.functions.iter().find(|f| f.name == n),
         };
         let (params, ok) = body_of(
             req.params,

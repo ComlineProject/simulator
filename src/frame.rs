@@ -52,6 +52,10 @@ pub fn classify(bytes: &[u8]) -> FrameKind {
     if bytes.len() == HANDSHAKE_LEN && bytes.first() == Some(&0x43) && bytes.get(1) == Some(&0x4f) {
         return FrameKind::Handshake;
     }
+    // A `comline@2` message: the `CO` magic, then its version, 2.
+    if bytes.starts_with(&[0x43, 0x4f, 2]) {
+        return FrameKind::Handshake;
+    }
     if bytes.first() == Some(&0x7b) {
         // `{` — a JSON-RPC frame; the `"method"` key marks the request side.
         if let Ok(text) = std::str::from_utf8(bytes) {

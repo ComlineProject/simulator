@@ -202,13 +202,16 @@ mod tests {
 
     fn shape() -> ProjectShape {
         ProjectShape {
+            connection: None,
             schemas: vec![SchemaShape {
                 namespace: "chat".into(),
                 ir_hash: "0x1".into(),
                 protocols: vec![ProtocolShape {
+                    number: None,
                     name: "Chat".into(),
                     framing: Framing::Datagram,
                     functions: vec![FnShape {
+                        call: None,
                         name: "send".into(),
                         index: 0,
                         oneway: false,
