@@ -1,0 +1,24 @@
+{
+  "artifacts": {
+    "simulator/wasm32": {
+      "bytes": 1226820,
+      "gzip_bytes": 284539
+    },
+    "simulator/wasm32-opt": {
+      "bytes": 673523,
+      "gzip_bytes": 255955
+    },
+    "simulator/wasm32-script": {
+      "bytes": 3817027,
+      "gzip_bytes": 756471
+    },
+    "simulator/wasm32-script-opt": {
+      "bytes": 2283274,
+      "gzip_bytes": 659195
+    }
+  },
+  "commit": "2432c17ab71e4733e7b4fdfb0ae7b5fb9752040d",
+  "format": 1,
+  "run": "https://github.com/ComlineProject/simulator/actions/runs/42460872515",
+  "toolchain": "rustc 1.99.1 (58cf8f9c3 2026-10-13)"
+}
