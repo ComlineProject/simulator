@@ -96,7 +96,7 @@ jobs:
         with:
           name: wasm
           path: wasm
-      - uses: ComlineProject/observatory/.github/actions/report-size@8d21b1fbe68f8b639676153ce1a308eaafdcc6a7 # v1
+      - uses: ComlineProject/observatory/.github/actions/report-size@6544a11bdfb9e4def0a64d6cff1cf8c3df464951 # v1
         with:
           output: simulator.size.json
           toolchain: ${{ needs.build.outputs.toolchain }}
@@ -132,7 +132,7 @@ jobs:
         with:
           name: simulator.size.json
           path: reports
-      - uses: ComlineProject/observatory/.github/actions/publish-report@8d21b1fbe68f8b639676153ce1a308eaafdcc6a7 # v1
+      - uses: ComlineProject/observatory/.github/actions/publish-report@6544a11bdfb9e4def0a64d6cff1cf8c3df464951 # v1
         with:
           reports: reports/simulator.size.json
           readme: .github/reports-branch.md
