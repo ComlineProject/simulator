@@ -6,24 +6,37 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# A newer push to the same pull request supersedes this run; a branch's runs
+# queue instead.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Container jobs default to `sh`; the steps are bash.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Rust 1.99.1 (what `rust-toolchain.toml` pins), the wasm32 target,
+    # wasm-bindgen (the CLI), wasm-opt (binaryen) and jq.
+    container: ghcr.io/comlineproject/ci-wasm@sha256:74efbad4c8b06d554d28e8a1e486f12ae5b6b4bd15a15db21a0925e020caa40a
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Rust toolchain
-        run: rustup update stable && rustup default stable && rustup target add wasm32-unknown-unknown
-
-      - name: Cache cargo + installed tools
-        uses: actions/cache@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            target
-          key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.lock') }}
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Test (native)
         run: cargo test
@@ -31,14 +44,14 @@ jobs:
       - name: Test (no scripting)
         run: cargo test --no-default-features
 
-      - name: wasm-bindgen CLI (matched to the crate)
+      # The CLI in the image is one version; the crate's `wasm-bindgen` is
+      # another, and the two must match exactly. A bump of the crate in
+      # Cargo.lock needs a CI image with the same CLI.
+      - name: wasm-bindgen CLI matches the crate
         run: |
           wb=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
-          wasm-bindgen --version 2>/dev/null | grep -qx "wasm-bindgen $wb" \
-            || cargo install wasm-bindgen-cli --version "=$wb" --locked
-
-      - name: wasm-opt
-        run: command -v wasm-opt || (sudo apt-get update -qq && sudo apt-get install -y -qq binaryen)
+          wasm-bindgen --version | grep -qx "wasm-bindgen $wb" \
+            || { echo "::error::the crate uses wasm-bindgen $wb; the CI image has $(wasm-bindgen --version)"; exit 1; }
 
       - name: Build WASM (scripted + lean)
         run: |

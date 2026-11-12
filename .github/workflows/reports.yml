@@ -3,7 +3,12 @@ name: Reports
 # Size report for the Observatory: the wasm build, before and after wasm-opt,
 # in the lean (no scripting) and the scripted flavour. On every push to `main`
 # (and a manual run) it's committed to the `reports` branch; elsewhere the
-# publish is a dry run.
+# publish is a dry run. A pull request runs the build and the measuring only
+# when this workflow (or the build script) changes, and never the publish.
+#
+# Three jobs, so that only `publish` can write and none of the repository's
+# code runs next to a write token: `build` (in the wasm CI image) makes the
+# four binaries, `size` measures them, `publish` commits the report.
 
 on:
   pull_request:
@@ -18,43 +23,41 @@ permissions:
   contents: read
 
 concurrency:
-  group: reports-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Container jobs default to `sh`; the steps are bash.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  size:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: ghcr.io/comlineproject/ci-wasm@sha256:74efbad4c8b06d554d28e8a1e486f12ae5b6b4bd15a15db21a0925e020caa40a
+    outputs:
+      toolchain: ${{ steps.rust.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Rust toolchain
         id: rust
-        run: |
-          rustup update stable && rustup default stable && rustup target add wasm32-unknown-unknown
-          echo "version=$(rustc --version)" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(rustc --version)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache cargo + installed tools
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            target
-          key: ${{ runner.os }}-wasm-${{ hashFiles('Cargo.lock') }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      - name: wasm-bindgen CLI (matched to the crate)
+      - name: wasm-bindgen CLI matches the crate
         run: |
           wb=$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
-          wasm-bindgen --version 2>/dev/null | grep -qx "wasm-bindgen $wb" \
-            || cargo install wasm-bindgen-cli --version "=$wb" --locked
-
-      - name: wasm-opt
-        run: command -v wasm-opt || (sudo apt-get update -qq && sudo apt-get install -y -qq binaryen)
+          wasm-bindgen --version | grep -qx "wasm-bindgen $wb" \
+            || { echo "::error::the crate uses wasm-bindgen $wb; the CI image has $(wasm-bindgen --version)"; exit 1; }
 
       - name: Build (optimized)
         run: |
@@ -70,22 +73,67 @@ jobs:
               target/wasm32-unknown-unknown/release/comline_simulator.wasm
           done
 
-      - uses: ComlineProject/observatory/.github/actions/report-size@v1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wasm
+          path: |
+            pkg/comline_simulator_bg.wasm
+            pkg-script/comline_simulator_bg.wasm
+            raw-lean/comline_simulator_bg.wasm
+            raw-script/comline_simulator_bg.wasm
+          if-no-files-found: error
+
+  size:
+    name: size
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wasm
+          path: wasm
+      - uses: ComlineProject/observatory/.github/actions/report-size@8d21b1fbe68f8b639676153ce1a308eaafdcc6a7 # v1
         with:
           output: simulator.size.json
-          toolchain: ${{ steps.rust.outputs.version }}
+          toolchain: ${{ needs.build.outputs.toolchain }}
           artifacts: |
-            simulator/wasm32-opt=pkg/comline_simulator_bg.wasm
-            simulator/wasm32=raw-lean/comline_simulator_bg.wasm
-            simulator/wasm32-script-opt=pkg-script/comline_simulator_bg.wasm
-            simulator/wasm32-script=raw-script/comline_simulator_bg.wasm
-
-      - uses: actions/upload-artifact@v7
+            simulator/wasm32-opt=wasm/pkg/comline_simulator_bg.wasm
+            simulator/wasm32=wasm/raw-lean/comline_simulator_bg.wasm
+            simulator/wasm32-script-opt=wasm/pkg-script/comline_simulator_bg.wasm
+            simulator/wasm32-script=wasm/raw-script/comline_simulator_bg.wasm
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: simulator.size.json
           path: simulator.size.json
-      - uses: ComlineProject/observatory/.github/actions/publish-report@v1
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: size
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
         with:
-          reports: simulator.size.json
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # This job pushes to the reports branch with the checkout's token.
+          persist-credentials: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: simulator.size.json
+          path: reports
+      - uses: ComlineProject/observatory/.github/actions/publish-report@8d21b1fbe68f8b639676153ce1a308eaafdcc6a7 # v1
+        with:
+          reports: reports/simulator.size.json
           readme: .github/reports-branch.md
           dry-run: ${{ github.ref != 'refs/heads/main' }}
